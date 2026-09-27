@@ -14,6 +14,7 @@ import (
 )
 
 type Config struct {
+	TopicControllerAuthorityURL        string          `yaml:"topicControllerAuthorityUrl"`
 	Port                               int             `yaml:"port"`
 	RedisAddr                          string          `yaml:"redisAddr"`
 	RedisPassword                      string          `yaml:"redisPassword"`
@@ -375,6 +376,9 @@ func applyEnvAndDefaults(c *Config) {
 	}
 	if v := os.Getenv("IDENTITY_AUDIENCE"); v != "" {
 		c.IdentityAudience = v
+	}
+	if v := os.Getenv("TOPIC_CONTROLLER_AUTHORITY_URL"); v != "" {
+		c.TopicControllerAuthorityURL = v
 	}
 	if v := os.Getenv("PRODUCER_AUTH_PROVIDER"); v != "" {
 		c.ProducerAuthProvider = v

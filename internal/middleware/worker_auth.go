@@ -20,6 +20,10 @@ func WorkerAuthMiddleware(workerValidator, producerValidator auth.Validator, cfg
 
 	return func(c *gin.Context) {
 		claims, err := validateBearer(workerValidator, c.GetHeader("Authorization"))
+		if err == nil && claims.HasScope(topicManageScope) {
+			c.AbortWithStatus(http.StatusForbidden)
+			return
+		}
 		if err == nil {
 			if len(claims.EventTypes) == 0 {
 				err = errors.New("missing eventTypes")
@@ -30,6 +34,10 @@ func WorkerAuthMiddleware(workerValidator, producerValidator auth.Validator, cfg
 		if err != nil {
 			if cfg.AllowProducerAsWorker && producerValidator != nil {
 				pclaims, perr := validateBearer(producerValidator, c.GetHeader("Authorization"))
+				if perr == nil && pclaims.HasScope(topicManageScope) {
+					c.AbortWithStatus(http.StatusForbidden)
+					return
+				}
 				if perr == nil {
 					claims = &auth.Claims{
 						Subject:    pclaims.Subject,

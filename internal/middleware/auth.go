@@ -31,6 +31,10 @@ func AuthMiddleware(validator auth.Validator, cfg *config.Config) gin.HandlerFun
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{tenantClaimsErrorKey: tenantClaimsErrorMessage})
 			return
 		}
+		if claims.HasScope(topicManageScope) && !authorizeTopicController(c, cfg, claims, tenantID) {
+			c.AbortWithStatus(http.StatusForbidden)
+			return
+		}
 		setProducerContext(c, cfg, claims, tenantID)
 		c.Next()
 	}

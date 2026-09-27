@@ -14,6 +14,10 @@ func AnyAuthMiddleware(workerValidator, producerValidator auth.Validator, cfg *c
 	return func(c *gin.Context) {
 		if workerValidator != nil {
 			claims, err := validateBearer(workerValidator, c.GetHeader("Authorization"))
+			if err == nil && claims.HasScope(topicManageScope) {
+				c.AbortWithStatus(http.StatusForbidden)
+				return
+			}
 			if err == nil && len(claims.EventTypes) > 0 {
 				tenantID, tenantErr := extractTenantID(claims)
 				if tenantErr != nil {
@@ -30,6 +34,10 @@ func AnyAuthMiddleware(workerValidator, producerValidator auth.Validator, cfg *c
 
 		if producerValidator != nil {
 			claims, err := validateBearer(producerValidator, c.GetHeader("Authorization"))
+			if err == nil && claims.HasScope(topicManageScope) {
+				c.AbortWithStatus(http.StatusForbidden)
+				return
+			}
 			if err == nil {
 				tenantID, tenantErr := extractTenantID(claims)
 				if tenantErr != nil {

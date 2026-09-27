@@ -11,6 +11,7 @@ import (
 )
 
 func SetupMappings(app *Application) {
+	registerRaftReadiness(app)
 	app.Engine.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	v1 := app.Engine.Group("/v1/codeq")
@@ -41,16 +42,17 @@ func SetupMappings(app *Application) {
 		anyAuth.GET("/raft/status", controllers.NewRaftStatusController(adaptRaftGroups(app.RaftGroups)).Handle)
 
 		admin := producer.Group("/admin", middleware.RequireAdmin())
+		topicAdmin := producer.Group("/admin", middleware.RequireTopicAdmin())
 		topicService := app.Topics
 		if topicService == nil {
 			topicService = topicsapp.NewUnavailableService("topic service not configured")
 		}
 		topicHandler := topicshttp.NewHandler(topicService)
-		admin.PUT("/topics/:topicName", topicHandler.Upsert)
-		admin.GET("/topics/:topicName", topicHandler.Get)
-		admin.DELETE("/topics/:topicName", topicHandler.Delete)
+		topicAdmin.PUT("/topics/:topicName", topicHandler.Upsert)
+		topicAdmin.GET("/topics/:topicName", topicHandler.Get)
+		topicAdmin.DELETE("/topics/:topicName", topicHandler.Delete)
 		admin.GET("/queues", controllers.NewQueuesAdminController(app.Scheduler).Handle)
-		admin.GET("/queues/:command", controllers.NewQueueStatsController(app.Scheduler).Handle)
+		topicAdmin.GET("/queues/:command", controllers.NewQueueStatsController(app.Scheduler).Handle)
 
 		// Novo: limpeza administrativa de tasks expiradas no índice Z
 		admin.POST("/tasks/cleanup", middleware.RateLimitAdminCleanup(app.RateLimiter, app.Config), controllers.NewCleanupExpiredController(app.Scheduler).Handle)
