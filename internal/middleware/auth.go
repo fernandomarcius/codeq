@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/osvaldoandrade/codeq/internal/authclaims"
 	"github.com/osvaldoandrade/codeq/pkg/auth"
 	"github.com/osvaldoandrade/codeq/pkg/config"
 
@@ -24,6 +25,9 @@ func AuthMiddleware(validator auth.Validator, cfg *config.Config) gin.HandlerFun
 		claims, err := validateBearer(validator, c.GetHeader("Authorization"))
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+			return
+		}
+		if !authorizeBindingScope(c, claims) {
 			return
 		}
 		tenantID, err := extractTenantID(claims)
@@ -63,7 +67,8 @@ func setProducerContext(c *gin.Context, cfg *config.Config, claims *auth.Claims,
 	if v, ok := claims.Raw["role"].(string); ok {
 		role = strings.ToUpper(strings.TrimSpace(v))
 	}
-	if role == "" && cfg.Env == "dev" {
+	// Binding-scoped tokens never acquire a role from a request header.
+	if role == "" && cfg.Env == "dev" && !authclaims.RequiresBindingScope(claims) {
 		role = strings.ToUpper(strings.TrimSpace(c.GetHeader("X-Role")))
 	}
 	if role == "" {

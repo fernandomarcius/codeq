@@ -68,6 +68,18 @@ var (
 		},
 		[]string{"scope", "operation"},
 	)
+
+	// BindingScopeDeniedTotal counts refused binding-scoped token requests
+	// (platform ADR-0022). Labels are bounded: reason is a fixed code set and
+	// route is a registered route template or a fixed gRPC stream name.
+	BindingScopeDeniedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "binding_scope_denied_total",
+			Help:      "Total number of refused binding-scoped token requests, labeled by reason and route.",
+		},
+		[]string{"reason", "route"},
+	)
 )
 
 func init() {
@@ -79,5 +91,6 @@ func init() {
 		LeaseExpiredTotal,
 		WebhookDeliveriesTotal,
 		RateLimitHitsTotal,
+		BindingScopeDeniedTotal,
 	)
 }

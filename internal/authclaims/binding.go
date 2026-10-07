@@ -142,27 +142,33 @@ func parseBindingObject(raw map[string]interface{}) (*BindingScope, error) {
 		return nil, deny(ReasonMissingBinding)
 	}
 	object, ok := value.(map[string]interface{})
-	if !ok || len(object) != len(bindingKeys) {
+	if !ok || !exactBindingKeys(object) {
 		return nil, deny(ReasonMalformedBinding)
-	}
-	for key := range object {
-		if !bindingKeys[key] {
-			return nil, deny(ReasonMalformedBinding)
-		}
 	}
 	uid, uidOK := object["uid"].(string)
 	topicID, topicOK := object["topicId"].(string)
 	policy, policyOK := object["policy"].(string)
 	generation, generationOK := bindingGeneration(object["generation"])
-	if !uidOK || !topicOK || !policyOK || !generationOK || !validBindingUID(uid) {
-		return nil, deny(ReasonMalformedBinding)
-	}
-	switch BindingPolicy(policy) {
-	case PolicyPublish, PolicySubscribe:
-	default:
+	if !uidOK || !topicOK || !policyOK || !generationOK || !validBindingUID(uid) || !validBindingPolicy(policy) {
 		return nil, deny(ReasonMalformedBinding)
 	}
 	return &BindingScope{UID: uid, Generation: generation, Policy: BindingPolicy(policy), TopicID: topicID}, nil
+}
+
+func validBindingPolicy(policy string) bool {
+	return BindingPolicy(policy) == PolicyPublish || BindingPolicy(policy) == PolicySubscribe
+}
+
+func exactBindingKeys(object map[string]interface{}) bool {
+	if len(object) != len(bindingKeys) {
+		return false
+	}
+	for key := range object {
+		if !bindingKeys[key] {
+			return false
+		}
+	}
+	return true
 }
 
 func bindingGeneration(value interface{}) (int64, bool) {

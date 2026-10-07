@@ -11,6 +11,12 @@ import (
 
 var bindingTestNow = time.Unix(1_800_000_000, 0)
 
+const (
+	testTenant  = "conveste"
+	testTopic   = "cflow-executar"
+	testTopicID = testTenant + "." + testTopic
+)
+
 const workerScopeString = "codeq:abandon codeq:claim codeq:heartbeat codeq:nack codeq:result"
 
 // bindingClaims builds validated claims the way the JWKS validator does:
@@ -24,13 +30,13 @@ func bindingClaims(policy BindingPolicy) *auth.Claims {
 		"iss":         "https://tikti.example",
 		"aud":         aud,
 		"sub":         "codefoundry:workload:conveste-hostgator:workload-conveste:cflow:6f9a",
-		"tid":         "conveste",
+		"tid":         testTenant,
 		"scope":       scope,
-		"eventTypes":  []interface{}{"cflow-executar"},
+		"eventTypes":  []interface{}{testTopic},
 		"cluster_ref": "conveste-hostgator",
 		BindingClaim: map[string]interface{}{
 			"uid": "7b1f5c2e-1111-4222-8333-944445555666", "generation": float64(3),
-			"policy": string(policy), "topicId": "conveste.cflow-executar",
+			"policy": string(policy), "topicId": testTopicID,
 		},
 	}
 	return claimsFromRaw(raw)
@@ -80,7 +86,7 @@ func TestResolveBindingScopeAcceptsBothPolicies(t *testing.T) {
 		}
 		want := BindingScope{
 			UID: "7b1f5c2e-1111-4222-8333-944445555666", Generation: 3, Policy: policy,
-			TopicID: "conveste.cflow-executar", TenantID: "conveste", EventType: "cflow-executar",
+			TopicID: testTopicID, TenantID: testTenant, EventType: testTopic,
 			Subject: "codefoundry:workload:conveste-hostgator:workload-conveste:cflow:6f9a",
 		}
 		if *scope != want {
@@ -99,7 +105,6 @@ func TestResolveBindingScopeAcceptsScopeOrderAndAudienceArray(t *testing.T) {
 	}
 }
 
-//nolint:funlen // One table enumerates every C1.1 refusal.
 func TestResolveBindingScopeRefusals(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -123,19 +128,19 @@ func TestResolveBindingScopeRefusals(t *testing.T) {
 		{"missing tid", PolicyPublish, func(r map[string]interface{}) { delete(r, "tid") }, ReasonTenant},
 		{"invalid tid", PolicyPublish, func(r map[string]interface{}) { r["tid"] = "Conveste" }, ReasonTenant},
 		{"padded tid", PolicyPublish, func(r map[string]interface{}) { r["tid"] = " conveste" }, ReasonTenant},
-		{"tenant alias same value", PolicyPublish, func(r map[string]interface{}) { r["tenantId"] = "conveste" }, ReasonTenant},
+		{"tenant alias same value", PolicyPublish, func(r map[string]interface{}) { r["tenantId"] = testTenant }, ReasonTenant},
 		{"organization alias", PolicySubscribe, func(r map[string]interface{}) { r["organization_id"] = "other" }, ReasonTenant},
 		{"wildcard event type", PolicySubscribe, func(r map[string]interface{}) { r["eventTypes"] = []interface{}{"*"} }, ReasonEventTypes},
 		{"two event types", PolicySubscribe, func(r map[string]interface{}) {
-			r["eventTypes"] = []interface{}{"cflow-executar", "other"}
+			r["eventTypes"] = []interface{}{testTopic, "other"}
 		}, ReasonEventTypes},
 		{"no event types", PolicyPublish, func(r map[string]interface{}) { r["eventTypes"] = []interface{}{} }, ReasonEventTypes},
 		{"hidden non-string event", PolicyPublish, func(r map[string]interface{}) {
-			r["eventTypes"] = []interface{}{"cflow-executar", float64(1)}
+			r["eventTypes"] = []interface{}{testTopic, float64(1)}
 		}, ReasonEventTypes},
-		{"event types not array", PolicyPublish, func(r map[string]interface{}) { r["eventTypes"] = "cflow-executar" }, ReasonEventTypes},
+		{"event types not array", PolicyPublish, func(r map[string]interface{}) { r["eventTypes"] = testTopic }, ReasonEventTypes},
 		{"event type with dot", PolicyPublish, func(r map[string]interface{}) {
-			r["eventTypes"] = []interface{}{"conveste.cflow-executar"}
+			r["eventTypes"] = []interface{}{testTopicID}
 			binding(r)["topicId"] = "conveste.conveste.cflow-executar"
 		}, ReasonEventTypes},
 		{"topic other tenant", PolicyPublish, func(r map[string]interface{}) { binding(r)["topicId"] = "other.cflow-executar" }, ReasonTopicMismatch},

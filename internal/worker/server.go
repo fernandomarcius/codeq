@@ -23,6 +23,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/osvaldoandrade/codeq/internal/authclaims"
+	"github.com/osvaldoandrade/codeq/internal/metrics"
 	"github.com/osvaldoandrade/codeq/internal/safeint"
 	"github.com/osvaldoandrade/codeq/internal/services"
 	"github.com/osvaldoandrade/codeq/internal/worker/workerpb"
@@ -248,6 +249,10 @@ func (s *Server) handleHello(stream workerpb.WorkerStream_StreamServer) (*stream
 		return nil, status.Errorf(codes.Internal, "no worker validator configured")
 	}
 	claims, err := s.authenticate(hello.Hello.Token)
+	if errors.Is(err, authclaims.ErrStreamNotAllowed) {
+		metrics.BindingScopeDeniedTotal.WithLabelValues(authclaims.ErrStreamNotAllowed.Error(), "grpc_worker_stream").Inc()
+		return nil, status.Error(codes.PermissionDenied, authclaims.ErrStreamNotAllowed.Error())
+	}
 	if err != nil {
 		return nil, status.Errorf(codes.Unauthenticated, "auth failed: %v", err)
 	}
@@ -520,6 +525,10 @@ func (s *Server) authenticate(token string) (*auth.Claims, error) {
 	}
 
 	claims, err := s.Validator.Validate(token)
+	// Binding-scoped tokens are HTTP-only (platform ADR-0022 C1.2).
+	if err == nil && authclaims.RequiresBindingScope(claims) {
+		return nil, authclaims.ErrStreamNotAllowed
+	}
 	if err == nil {
 		if claimErr := validateWorkerClaims(claims); claimErr != nil {
 			err = claimErr
@@ -530,6 +539,10 @@ func (s *Server) authenticate(token string) (*auth.Claims, error) {
 
 	if s.AllowProducerAsWorker && s.ProducerValidator != nil {
 		pclaims, perr := s.ProducerValidator.Validate(token)
+		if perr == nil && authclaims.RequiresBindingScope(pclaims) {
+			// Never promote a binding-scoped or codeq:publish token.
+			return nil, authclaims.ErrStreamNotAllowed
+		}
 		if perr == nil {
 			raw := pclaims.Raw
 			if raw == nil {

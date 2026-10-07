@@ -4,11 +4,19 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/osvaldoandrade/codeq/internal/authclaims"
 	"github.com/osvaldoandrade/codeq/pkg/auth"
 	"github.com/osvaldoandrade/codeq/pkg/config"
 
 	"github.com/gin-gonic/gin"
 )
+
+// workerClaimScope authorizes the claim routes.
+const workerClaimScope = "codeq:claim"
+
+// promotedWorkerScopes is the full worker scope set granted to a producer
+// token promoted by ALLOW_PRODUCER_AS_WORKER (unchanged legacy behavior).
+var promotedWorkerScopes = []string{workerClaimScope, "codeq:heartbeat", "codeq:abandon", "codeq:nack", "codeq:result", "codeq:subscribe"}
 
 // WorkerAuthMiddleware creates worker authentication middleware with the provided validators
 func WorkerAuthMiddleware(workerValidator, producerValidator auth.Validator, cfg *config.Config) gin.HandlerFunc {
@@ -19,45 +27,32 @@ func WorkerAuthMiddleware(workerValidator, producerValidator auth.Validator, cfg
 	}
 
 	return func(c *gin.Context) {
-		claims, err := validateBearer(workerValidator, c.GetHeader("Authorization"))
+		header := c.GetHeader("Authorization")
+		claims, err := validateBearer(workerValidator, header)
 		if err == nil && claims.HasScope(topicManageScope) {
 			c.AbortWithStatus(http.StatusForbidden)
 			return
 		}
-		if err == nil {
-			if len(claims.EventTypes) == 0 {
-				err = errors.New("missing eventTypes")
-			} else if len(claims.Scopes) == 0 {
-				err = errors.New("missing scope")
-			}
+		// A binding-scoped worker token is judged only by the binding
+		// contract; it never falls back to producer promotion.
+		if err == nil && !authclaims.RequiresBindingScope(claims) {
+			err = validateWorkerShape(claims)
 		}
 		if err != nil {
-			if cfg.AllowProducerAsWorker && producerValidator != nil {
-				pclaims, perr := validateBearer(producerValidator, c.GetHeader("Authorization"))
-				if perr == nil && pclaims.HasScope(topicManageScope) {
-					c.AbortWithStatus(http.StatusForbidden)
-					return
-				}
-				if perr == nil {
-					claims = &auth.Claims{
-						Subject:    pclaims.Subject,
-						Email:      pclaims.Email,
-						Issuer:     "producer",
-						Audience:   []string{cfg.WorkerAudience},
-						ExpiresAt:  pclaims.ExpiresAt,
-						IssuedAt:   pclaims.IssuedAt,
-						Scopes:     []string{"codeq:claim", "codeq:heartbeat", "codeq:abandon", "codeq:nack", "codeq:result", "codeq:subscribe"},
-						EventTypes: []string{"*"},
-						Raw:        pclaims.Raw,
-					}
-				} else {
-					c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
-					return
-				}
-			} else {
+			promoted, status := promoteProducerToWorker(c, header, producerValidator, cfg)
+			switch status {
+			case http.StatusOK:
+				claims = promoted
+			case http.StatusForbidden:
+				c.AbortWithStatus(http.StatusForbidden)
+				return
+			default:
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 				return
 			}
+		}
+		if !authorizeBindingScope(c, claims) {
+			return
 		}
 		c.Set("workerClaims", claims)
 
@@ -70,6 +65,50 @@ func WorkerAuthMiddleware(workerValidator, producerValidator auth.Validator, cfg
 
 		c.Next()
 	}
+}
+
+func validateWorkerShape(claims *auth.Claims) error {
+	if len(claims.EventTypes) == 0 {
+		return errors.New("missing eventTypes")
+	}
+	if len(claims.Scopes) == 0 {
+		return errors.New("missing scope")
+	}
+	return nil
+}
+
+// promoteProducerToWorker implements the ALLOW_PRODUCER_AS_WORKER
+// compatibility mode. It returns http.StatusOK with promoted claims,
+// http.StatusForbidden for a topic-controller token, or
+// http.StatusUnauthorized when promotion is unavailable. Binding-scoped
+// tokens and any token carrying codeq:publish are never promoted
+// (platform ADR-0022 C1.1).
+func promoteProducerToWorker(c *gin.Context, header string, producerValidator auth.Validator, cfg *config.Config) (*auth.Claims, int) {
+	if cfg == nil || !cfg.AllowProducerAsWorker || producerValidator == nil {
+		return nil, http.StatusUnauthorized
+	}
+	pclaims, err := validateBearer(producerValidator, header)
+	if err != nil {
+		return nil, http.StatusUnauthorized
+	}
+	if pclaims.HasScope(topicManageScope) {
+		return nil, http.StatusForbidden
+	}
+	if authclaims.RequiresBindingScope(pclaims) {
+		RecordBindingDenial("producer_promotion", routeLabel(c))
+		return nil, http.StatusUnauthorized
+	}
+	return &auth.Claims{
+		Subject:    pclaims.Subject,
+		Email:      pclaims.Email,
+		Issuer:     "producer",
+		Audience:   []string{cfg.WorkerAudience},
+		ExpiresAt:  pclaims.ExpiresAt,
+		IssuedAt:   pclaims.IssuedAt,
+		Scopes:     append([]string(nil), promotedWorkerScopes...),
+		EventTypes: []string{"*"},
+		Raw:        pclaims.Raw,
+	}, http.StatusOK
 }
 
 func GetWorkerClaims(c *gin.Context) (*auth.Claims, bool) {
