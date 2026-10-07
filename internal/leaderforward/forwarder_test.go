@@ -21,11 +21,14 @@ import (
 )
 
 const (
-	testToken   = "Bearer super-secret-binding-token"
-	testRoute   = "/v1/codeq/tasks"
-	selfID      = "codeq-0"
-	selfURL     = "http://codeq-0.codecloud-queue.svc.cluster.local:8080"
-	unavailable = `{"error":"leader_unavailable"}`
+	testToken       = "Bearer super-secret-binding-token"
+	testRoute       = "/v1/codeq/tasks"
+	selfID          = "codeq-0"
+	peerOneID       = "codeq-1"
+	peerOneURL      = "http://codeq-1.codecloud-queue.svc.cluster.local:8080"
+	userinfoPeerURL = "http://user:pw@codeq-1:8080"
+	selfURL         = "http://codeq-0.codecloud-queue.svc.cluster.local:8080"
+	unavailable     = `{"error":"leader_unavailable"}`
 )
 
 type fakeGroup struct{ err error }
@@ -76,7 +79,7 @@ func accepted(w http.ResponseWriter, _ *http.Request) {
 
 func newForwarder(t *testing.T, leaderURL string, groups []Leadership, logs io.Writer) *Forwarder {
 	t.Helper()
-	peers := map[string]string{selfID: selfURL, "codeq-1": "http://codeq-1.codecloud-queue.svc.cluster.local:8080"}
+	peers := map[string]string{selfID: selfURL, peerOneID: peerOneURL}
 	if leaderURL != "" {
 		peers["codeq-2"] = leaderURL
 	}
@@ -223,8 +226,8 @@ func TestOnlyExactConfiguredPeersAreTargets(t *testing.T) {
 }
 
 func TestMalformedPeerURLsAreExcluded(t *testing.T) {
-	for _, bad := range []string{"ftp://codeq-1:8080", "http://user:pw@codeq-1:8080", "http://codeq-1:8080?x=1", "http://codeq-1:8080#f", "codeq-1:8080", "http://"} {
-		f := New(Config{PeerHTTPAddrs: map[string]string{"codeq-1": bad}, SelfID: selfID})
+	for _, bad := range []string{"ftp://codeq-1:8080", userinfoPeerURL, "http://codeq-1:8080?x=1", "http://codeq-1:8080#f", "codeq-1:8080", "http://"} {
+		f := New(Config{PeerHTTPAddrs: map[string]string{peerOneID: bad}, SelfID: selfID})
 		if f.allowedTarget(bad) {
 			t.Fatalf("malformed peer %q accepted", bad)
 		}

@@ -12,10 +12,10 @@ import (
 // joined target URL keeps the peer's scheme and host.
 func FuzzForwardTarget(f *testing.F) {
 	seeds := [][2]string{
-		{"http://codeq-1.codecloud-queue.svc.cluster.local:8080", "http://codeq-1.codecloud-queue.svc.cluster.local:8080"},
+		{peerOneURL, peerOneURL},
 		{"http://codeq-1:8080", "http://codeq-1:8080/"},
 		{"http://codeq-1:8080", "http://attacker.example"},
-		{"http://user:pw@codeq-1:8080", "http://user:pw@codeq-1:8080"},
+		{userinfoPeerURL, userinfoPeerURL},
 		{"https://codeq-2:8443/prefix", "https://codeq-2:8443/prefix"},
 		{"", ""},
 	}
@@ -24,7 +24,7 @@ func FuzzForwardTarget(f *testing.F) {
 	}
 	const self = "http://codeq-0:8080"
 	f.Fuzz(func(t *testing.T, peer, hint, requestURI string) {
-		fw := New(Config{PeerHTTPAddrs: map[string]string{"codeq-0": self, "codeq-1": peer}, SelfID: "codeq-0"})
+		fw := New(Config{PeerHTTPAddrs: map[string]string{"codeq-0": self, peerOneID: peer}, SelfID: "codeq-0"})
 		if !fw.allowedTarget(hint) {
 			return
 		}
