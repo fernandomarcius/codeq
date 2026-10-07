@@ -17,7 +17,9 @@ func NewGetTaskController(svc services.SchedulerService) *getTaskController {
 func (h *getTaskController) Handle(c *gin.Context) {
 	taskID := c.Param("id")
 	task, err := h.svc.GetTask(c.Request.Context(), taskID)
-	if err != nil {
+	// A task outside the token tenant (or binding command) is reported
+	// exactly like a missing one, so there is no existence oracle.
+	if err != nil || !taskVisible(c, task) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}

@@ -6,11 +6,15 @@ import (
 	"time"
 
 	"github.com/osvaldoandrade/codeq/internal/services"
+	"github.com/osvaldoandrade/codeq/pkg/domain"
 
 	"github.com/gin-gonic/gin"
 )
 
 const (
+	// errTaskNotFound is the missing-task text, shared with foreign tasks so
+	// the route is not an existence oracle.
+	errTaskNotFound = "task not found"
 	// maxLongPollSeconds caps `?waitSeconds=` to keep connection budgets
 	// predictable. Producers that want to wait longer should retry.
 	maxLongPollSeconds = 60
@@ -35,16 +39,25 @@ func (h *getResultController) Handle(c *gin.Context) {
 	id := c.Param("id")
 	wait := parseWaitSeconds(c.Query("waitSeconds"))
 
-	if rec, task, err := h.svc.Get(c.Request.Context(), id); err == nil {
+	rec, task, err := h.svc.Get(c.Request.Context(), id)
+	if resultHidden(c, task, err) {
+		writeTaskNotFound(c)
+		return
+	}
+	if err == nil {
 		c.JSON(http.StatusOK, gin.H{"task": task, "result": rec})
 		return
-	} else if wait == 0 || err.Error() == "task not found" {
+	}
+	if wait == 0 || err.Error() == errTaskNotFound {
 		// No long-poll requested, or the task itself doesn't exist —
 		// no amount of waiting will make a result appear.
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
+	h.longPoll(c, id, wait)
+}
 
+func (h *getResultController) longPoll(c *gin.Context, id string, wait int) {
 	deadline := time.NewTimer(time.Duration(wait) * time.Second)
 	defer deadline.Stop()
 	tick := time.NewTicker(longPollInterval)
@@ -57,6 +70,10 @@ func (h *getResultController) Handle(c *gin.Context) {
 			return
 		case <-deadline.C:
 			rec, task, err := h.svc.Get(c.Request.Context(), id)
+			if resultHidden(c, task, err) {
+				writeTaskNotFound(c)
+				return
+			}
 			if err != nil {
 				c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 				return
@@ -65,6 +82,10 @@ func (h *getResultController) Handle(c *gin.Context) {
 			return
 		case <-tick.C:
 			rec, task, err := h.svc.Get(c.Request.Context(), id)
+			if resultHidden(c, task, err) {
+				writeTaskNotFound(c)
+				return
+			}
 			if err != nil {
 				continue
 			}
@@ -72,6 +93,22 @@ func (h *getResultController) Handle(c *gin.Context) {
 			return
 		}
 	}
+}
+
+// resultHidden reports whether a lookup returned a task the token may not
+// read (or a result without its task). A missing task (task nil with an
+// error) keeps today's response; a foreign task is answered with the same
+// "task not found" body immediately, without long-polling, so neither the
+// body nor the latency reveals that it exists.
+func resultHidden(c *gin.Context, task *domain.Task, err error) bool {
+	if task == nil && err != nil {
+		return false
+	}
+	return !taskVisible(c, task)
+}
+
+func writeTaskNotFound(c *gin.Context) {
+	c.JSON(http.StatusNotFound, gin.H{"error": errTaskNotFound})
 }
 
 func parseWaitSeconds(raw string) int {
