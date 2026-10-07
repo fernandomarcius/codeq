@@ -221,10 +221,18 @@ func createOnAny(t *testing.T, nodes []*raftTestNode, body string, timeout time.
 		nn, _ := resp.Body.Read(b)
 		resp.Body.Close()
 		lastBody = string(b[:nn])
-		if !strings.Contains(lastBody, "not leader") {
+		if !retryableLeaderBody(lastBody) {
 			return "", fmt.Errorf("status %d body=%s", resp.StatusCode, lastBody)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	return "", fmt.Errorf("timeout waiting for leader across %d nodes (last=%s)", len(nodes), lastBody)
+}
+
+// retryableLeaderBody reports whether a failed create is a transient
+// leadership answer: the per-item "not leader" text, or the follower's
+// 503 leader_unavailable (platform ADR-0022 C1.5) while groups elect or
+// when no single peer leads the group a fresh task ID hashed to.
+func retryableLeaderBody(body string) bool {
+	return strings.Contains(body, "not leader") || strings.Contains(body, "leader_unavailable")
 }

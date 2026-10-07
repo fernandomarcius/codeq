@@ -198,7 +198,7 @@ func createTaskWithRetry(t *testing.T, baseURL, body string, timeout time.Durati
 		n, _ := resp.Body.Read(b)
 		resp.Body.Close()
 		lastBody = string(b[:n])
-		if !strings.Contains(lastBody, "not leader") {
+		if !retryableLeaderBody(lastBody) {
 			return "", fmt.Errorf("status %d body=%s", resp.StatusCode, lastBody)
 		}
 		time.Sleep(30 * time.Millisecond)

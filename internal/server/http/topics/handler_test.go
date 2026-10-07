@@ -3,6 +3,7 @@ package topics
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/osvaldoandrade/codeq/internal/core/queuetopic"
+	"github.com/osvaldoandrade/codeq/internal/leaderforward"
 )
 
 type fakeService struct {
@@ -106,19 +108,49 @@ func TestHandlerDeleteRequiresExplicitPolicy(t *testing.T) {
 	}
 }
 
-func TestHandlerRedirectsFollowerWrites(t *testing.T) {
-	service := &fakeService{err: &leaderError{url: "http://leader:8080/"}}
-	response := request(t, service, http.MethodPut, "/v1/codeq/admin/topics/events?trace=1", validBody)
-	if response.Code != http.StatusTemporaryRedirect {
-		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+func TestHandlerFollowerWritesNeverRedirect(t *testing.T) {
+	for name, url := range map[string]string{"known leader": "http://leader:8080/", "unknown leader": ""} {
+		response := request(t, &fakeService{err: &leaderError{url: url}}, http.MethodPut, "/v1/codeq/admin/topics/events?trace=1", validBody)
+		if response.Code != http.StatusServiceUnavailable || response.Header().Get("Location") != "" {
+			t.Fatalf("%s: status = %d location=%q body=%s", name, response.Code, response.Header().Get("Location"), response.Body.String())
+		}
+		if response.Header().Get("Retry-After") != "1" || !strings.Contains(response.Body.String(), leaderforward.CodeLeaderUnavailable) {
+			t.Fatalf("%s: not a retryable leader_unavailable: %v %s", name, response.Header(), response.Body.String())
+		}
 	}
-	if got, want := response.Header().Get("Location"), "http://leader:8080/v1/codeq/admin/topics/events?trace=1"; got != want {
-		t.Fatalf("Location = %q, want %q", got, want)
-	}
+}
 
-	response = request(t, &fakeService{err: &leaderError{}}, http.MethodDelete, "/v1/codeq/admin/topics/events?deletionPolicy=Delete", "")
-	if response.Code != http.StatusServiceUnavailable {
-		t.Fatalf("unknown leader status = %d body=%s", response.Code, response.Body.String())
+func TestHandlerForwardsFollowerWritesToConfiguredLeader(t *testing.T) {
+	type seen struct{ method, uri, body, forwarded, auth string }
+	got := make(chan seen, 1)
+	leader := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got <- seen{r.Method, r.URL.RequestURI(), string(b), r.Header.Get(leaderforward.HeaderForwarded), r.Header.Get("Authorization")}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"topicId":"payments.events"}`))
+	}))
+	defer leader.Close()
+	fwd := leaderforward.New(leaderforward.Config{
+		PeerHTTPAddrs: map[string]string{"node-1": "http://self.invalid:8080", "node-2": leader.URL},
+		SelfID:        "node-1",
+	})
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.Use(func(c *gin.Context) { c.Set("tenantID", "payments"); c.Next() })
+	handler := NewHandler(&fakeService{err: &leaderError{url: leader.URL}})
+	engine.PUT("/v1/codeq/admin/topics/:topicName", fwd.Single(), handler.Upsert)
+	req := httptest.NewRequest(http.MethodPut, "/v1/codeq/admin/topics/events?trace=1", strings.NewReader(validBody))
+	req.Header.Set("Authorization", "Bearer topic-controller")
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, req)
+	if response.Code != http.StatusCreated || response.Body.String() != `{"topicId":"payments.events"}` {
+		t.Fatalf("relayed status = %d body=%s", response.Code, response.Body.String())
+	}
+	s := <-got
+	want := seen{http.MethodPut, "/v1/codeq/admin/topics/events?trace=1", validBody, "1", "Bearer topic-controller"}
+	if s != want {
+		t.Fatalf("leader saw %+v, want %+v", s, want)
 	}
 }
 

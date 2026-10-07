@@ -35,7 +35,7 @@ func (h *heartbeatController) Handle(c *gin.Context) {
 		return
 	}
 	if err := h.svc.Heartbeat(c.Request.Context(), taskID, claims.Subject, req.ExtendSeconds); err != nil {
-		if maybeRedirectLeader(c, err) {
+		if maybeForwardLeader(c, err) {
 			return
 		}
 		status := http.StatusInternalServerError

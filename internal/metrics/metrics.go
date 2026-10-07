@@ -80,6 +80,18 @@ var (
 		},
 		[]string{"reason", "route"},
 	)
+
+	// LeaderForwardTotal counts follower-to-leader forwarding decisions
+	// (platform ADR-0022 C1.5). Labels are bounded: route is a registered
+	// route template and result is a fixed set defined by leaderforward.
+	LeaderForwardTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "leader_forward_total",
+			Help:      "Total number of follower-to-leader request forwards, labeled by route and result.",
+		},
+		[]string{"route", "result"},
+	)
 )
 
 func init() {
@@ -92,5 +104,6 @@ func init() {
 		WebhookDeliveriesTotal,
 		RateLimitHitsTotal,
 		BindingScopeDeniedTotal,
+		LeaderForwardTotal,
 	)
 }

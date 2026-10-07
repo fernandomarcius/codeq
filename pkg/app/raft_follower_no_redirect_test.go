@@ -13,13 +13,13 @@ import (
 	"github.com/osvaldoandrade/codeq/pkg/config"
 )
 
-// TestRaft_307RedirectsToLeader verifies that hitting a follower with
-// a write returns HTTP 307 + Location pointing at the leader's HTTP
-// URL. Go's http.Client follows the redirect transparently.
+// TestRaft_FollowerForwardsInsteadOf307 replaces the former 307 test. It
+// verifies that a follower never answers 307 and instead forwards the write
+// to the leader's configured HTTP URL (platform ADR-0022 C1.5).
 //
 // Single-shard 3-node setup so the test can pre-grab a known leader
 // and a known follower without race.
-func TestRaft_307RedirectsToLeader(t *testing.T) {
+func TestRaft_FollowerForwardsInsteadOf307(t *testing.T) {
 	ports := pickThreeFreePorts(t)
 	peers := map[string]string{
 		"node-1": "127.0.0.1:" + ports[0],
@@ -109,8 +109,9 @@ func TestRaft_307RedirectsToLeader(t *testing.T) {
 	follower := (leader + 1) % len(ids)
 	t.Logf("follower: %s", ids[follower])
 
-	// Send a write to the follower WITHOUT following redirects, so we
-	// can inspect the 307 response directly.
+	// Send a write to the follower WITHOUT following redirects. Since
+	// platform ADR-0022 C1.5 the follower forwards in-process, so the
+	// client gets the leader's 202 directly and never a 307.
 	client := &http.Client{
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -127,33 +128,11 @@ func TestRaft_307RedirectsToLeader(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusTemporaryRedirect {
-		t.Fatalf("expected 307 from follower, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected the leader's 202 through the follower, got %d", resp.StatusCode)
 	}
-	location := resp.Header.Get("Location")
-	if location == "" {
-		t.Fatal("307 response missing Location header")
-	}
-	if !strings.HasPrefix(location, srvs[leader].URL) {
-		t.Errorf("Location %q should start with leader URL %q", location, srvs[leader].URL)
-	}
-	if !strings.HasSuffix(location, "/v1/codeq/tasks") {
-		t.Errorf("Location %q should end with the request path", location)
-	}
-
-	// Verify a follow-the-redirect client (standard Go default)
-	// succeeds with a single high-level call.
-	followClient := &http.Client{Timeout: 3 * time.Second}
-	req2, _ := http.NewRequest(http.MethodPost, srvs[follower].URL+"/v1/codeq/tasks", strings.NewReader(body))
-	req2.Header.Set("Authorization", "Bearer dev-token")
-	req2.Header.Set("Content-Type", "application/json")
-	resp2, err := followClient.Do(req2)
-	if err != nil {
-		t.Fatalf("POST with redirect follow: %v", err)
-	}
-	defer resp2.Body.Close()
-	if resp2.StatusCode != http.StatusAccepted {
-		t.Errorf("after redirect: want 202, got %d", resp2.StatusCode)
+	if location := resp.Header.Get("Location"); location != "" {
+		t.Fatalf("follower leaked a redirect Location %q", location)
 	}
 }
 

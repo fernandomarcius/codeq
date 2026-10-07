@@ -7,13 +7,12 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/osvaldoandrade/codeq/internal/core/queuetopic"
+	"github.com/osvaldoandrade/codeq/internal/leaderforward"
 	"github.com/osvaldoandrade/codeq/internal/middleware"
-	"github.com/osvaldoandrade/codeq/pkg/domain"
 )
 
 const (
@@ -97,16 +96,10 @@ func decodePolicy(c *gin.Context, policy *queuetopic.Policy) error {
 }
 
 func writeError(c *gin.Context, err error) {
-	var leaderHint domain.LeaderHint
-	if errors.As(err, &leaderHint) {
-		leader := leaderHint.LeaderHTTPAddr()
-		if leader == "" {
-			c.JSON(http.StatusServiceUnavailable, gin.H{errorKey: "queue topic leader unavailable"})
-			return
-		}
-		location := strings.TrimSuffix(leader, "/") + c.Request.URL.RequestURI()
-		c.Header("Location", location)
-		c.JSON(http.StatusTemporaryRedirect, gin.H{errorKey: "not leader", "leader": leader})
+	// A follower forwards the write to the configured leader in-process
+	// (platform ADR-0022 C1.5) or answers 503 leader_unavailable; it never
+	// answers 307.
+	if leaderforward.HandleNotLeader(c, err) {
 		return
 	}
 	var validation *queuetopic.ValidationError

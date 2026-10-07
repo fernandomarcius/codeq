@@ -18,17 +18,22 @@ func SetupMappings(app *Application) {
 	producer := v1.Group("", middleware.AuthMiddleware(app.ProducerValidator, app.Config))
 	worker := v1.Group("", middleware.WorkerAuthMiddleware(app.WorkerValidator, app.ProducerValidator, app.Config))
 	anyAuth := v1.Group("", middleware.AnyAuthMiddleware(app.WorkerValidator, app.ProducerValidator, app.Config))
+	// Leader forwarding (platform ADR-0022 C1.5) runs after authentication,
+	// the binding route allow-list and worker scope checks, and before rate
+	// limiting and the controller, so a follower never forwards an
+	// unauthenticated request and the leader counts the request once.
+	fwd := app.LeaderForward
 	{
-		producer.POST("/tasks", middleware.RateLimitProducer(app.RateLimiter, app.Config), controllers.NewCreateTaskController(app.Scheduler).Handle)
-		producer.POST("/tasks/batch", middleware.RateLimitProducer(app.RateLimiter, app.Config), controllers.NewBatchCreateTaskController(app.Scheduler).Handle)
+		producer.POST("/tasks", fwd.Single(), middleware.RateLimitProducer(app.RateLimiter, app.Config), controllers.NewCreateTaskController(app.Scheduler).Handle)
+		producer.POST("/tasks/batch", fwd.Batch(), middleware.RateLimitProducer(app.RateLimiter, app.Config), controllers.NewBatchCreateTaskController(app.Scheduler).Handle)
 
-		worker.POST("/tasks/claim", middleware.RequireWorkerScope("codeq:claim"), middleware.RateLimitWorkerClaim(app.RateLimiter, app.Config), controllers.NewClaimTaskController(app.Scheduler).Handle)
-		worker.POST("/tasks/claim/batch", middleware.RequireWorkerScope("codeq:claim"), middleware.RateLimitWorkerClaim(app.RateLimiter, app.Config), controllers.NewBatchClaimTaskController(app.Scheduler).Handle)
-		worker.POST("/tasks/:id/heartbeat", middleware.RequireWorkerScope("codeq:heartbeat"), controllers.NewHeartbeatController(app.Scheduler).Handle)
-		worker.POST("/tasks/:id/abandon", middleware.RequireWorkerScope("codeq:abandon"), controllers.NewAbandonController(app.Scheduler).Handle)
-		worker.POST("/tasks/:id/nack", middleware.RequireWorkerScope("codeq:nack"), controllers.NewNackController(app.Scheduler).Handle)
-		worker.POST("/tasks/:id/result", middleware.RequireWorkerScope("codeq:result"), controllers.NewSubmitResultController(app.Results).Handle)
-		worker.POST("/tasks/batch/results", middleware.RequireWorkerScope("codeq:result"), controllers.NewBatchSubmitResultController(app.Results).Handle)
+		worker.POST("/tasks/claim", middleware.RequireWorkerScope("codeq:claim"), fwd.Claim(), middleware.RateLimitWorkerClaim(app.RateLimiter, app.Config), controllers.NewClaimTaskController(app.Scheduler).Handle)
+		worker.POST("/tasks/claim/batch", middleware.RequireWorkerScope("codeq:claim"), fwd.Batch(), middleware.RateLimitWorkerClaim(app.RateLimiter, app.Config), controllers.NewBatchClaimTaskController(app.Scheduler).Handle)
+		worker.POST("/tasks/:id/heartbeat", middleware.RequireWorkerScope("codeq:heartbeat"), fwd.Single(), controllers.NewHeartbeatController(app.Scheduler).Handle)
+		worker.POST("/tasks/:id/abandon", middleware.RequireWorkerScope("codeq:abandon"), fwd.Single(), controllers.NewAbandonController(app.Scheduler).Handle)
+		worker.POST("/tasks/:id/nack", middleware.RequireWorkerScope("codeq:nack"), fwd.Single(), controllers.NewNackController(app.Scheduler).Handle)
+		worker.POST("/tasks/:id/result", middleware.RequireWorkerScope("codeq:result"), fwd.Single(), controllers.NewSubmitResultController(app.Results).Handle)
+		worker.POST("/tasks/batch/results", middleware.RequireWorkerScope("codeq:result"), fwd.Batch(), controllers.NewBatchSubmitResultController(app.Results).Handle)
 		worker.POST("/workers/subscriptions", middleware.RequireWorkerScope("codeq:subscribe"), controllers.NewCreateSubscriptionController(app.Subs).Handle)
 		worker.POST("/workers/subscriptions/:id/heartbeat", middleware.RequireWorkerScope("codeq:subscribe"), controllers.NewHeartbeatSubscriptionController(app.Subs).Handle)
 
@@ -48,9 +53,9 @@ func SetupMappings(app *Application) {
 			topicService = topicsapp.NewUnavailableService("topic service not configured")
 		}
 		topicHandler := topicshttp.NewHandler(topicService)
-		topicAdmin.PUT("/topics/:topicName", topicHandler.Upsert)
+		topicAdmin.PUT("/topics/:topicName", fwd.Single(), topicHandler.Upsert)
 		topicAdmin.GET("/topics/:topicName", topicHandler.Get)
-		topicAdmin.DELETE("/topics/:topicName", topicHandler.Delete)
+		topicAdmin.DELETE("/topics/:topicName", fwd.Single(), topicHandler.Delete)
 		admin.GET("/queues", controllers.NewQueuesAdminController(app.Scheduler).Handle)
 		topicAdmin.GET("/queues/:command", controllers.NewQueueStatsController(app.Scheduler).Handle)
 

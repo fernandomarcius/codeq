@@ -75,11 +75,11 @@ func (h *batchClaimTaskController) Handle(c *gin.Context) {
 	}
 
 	var tasks []*domain.Task
-	var claimErr string
+	var claimErr error
 	for i := 0; i < req.Count; i++ {
 		task, ok, err := h.svc.ClaimTask(c.Request.Context(), claims.Subject, req.Commands, req.LeaseSeconds, 0, tenantID)
 		if err != nil {
-			claimErr = err.Error()
+			claimErr = err
 			break
 		}
 		if !ok {
@@ -89,16 +89,21 @@ func (h *batchClaimTaskController) Handle(c *gin.Context) {
 	}
 
 	if len(tasks) == 0 {
-		if claimErr != "" {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": claimErr})
+		// Nothing was claimed here, so a leadership change after the
+		// route gate can still forward the whole request.
+		if claimErr != nil && maybeForwardLeader(c, claimErr) {
+			return
+		}
+		if claimErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": claimErr.Error()})
 			return
 		}
 		c.Status(http.StatusNoContent)
 		return
 	}
 	resp := gin.H{"tasks": tasks}
-	if claimErr != "" {
-		resp["error"] = claimErr
+	if claimErr != nil {
+		resp["error"] = claimErr.Error()
 	}
 	c.JSON(http.StatusOK, resp)
 }

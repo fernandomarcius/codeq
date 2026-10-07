@@ -37,7 +37,7 @@ func (h *nackController) Handle(c *gin.Context) {
 	}
 	delay, movedToDLQ, err := h.svc.NackTask(c.Request.Context(), taskID, claims.Subject, req.DelaySeconds, req.Reason)
 	if err != nil {
-		if maybeRedirectLeader(c, err) {
+		if maybeForwardLeader(c, err) {
 			return
 		}
 		status := http.StatusInternalServerError

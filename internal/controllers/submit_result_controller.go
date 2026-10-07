@@ -34,9 +34,9 @@ func (h *submitResultController) Handle(c *gin.Context) {
 	req.WorkerID = claims.Subject
 	rec, err := h.svc.Submit(c.Request.Context(), id, req)
 	if err != nil {
-		// 307-redirect "not leader" before the per-error status map
+		// Forward "not leader" before the per-error status map
 		// — otherwise a NotLeaderError would fall into 400.
-		if maybeRedirectLeader(c, err) {
+		if maybeForwardLeader(c, err) {
 			return
 		}
 		status := http.StatusBadRequest

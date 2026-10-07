@@ -1,0 +1,172 @@
+package leaderforward
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/osvaldoandrade/codeq/internal/metrics"
+)
+
+// Bounded values of the result label of codeq_leader_forward_total.
+const (
+	resultOK                  = "ok"
+	resultUpstreamUnavailable = "upstream_unavailable"
+	resultLoop                = "loop"
+	resultUnconfigured        = "unconfigured"
+	resultNoLeader            = "no_leader"
+	resultTooLarge            = "body_too_large"
+	resultTimeout             = "timeout"
+	resultCanceled            = "canceled"
+	resultError               = "error"
+	resultRedirect            = "redirect_refused"
+	resultDisabled            = "disabled"
+
+	logEvent          = "codeq_leader_forward"
+	maxLoggedValueLen = 256
+	unknownRoute      = "unknown"
+)
+
+// forwardedRequestHeaders are the only request headers sent to the leader.
+// Authorization and the dev-only X-Role are the leader's authentication
+// input; X-Request-Id keeps one correlation ID across both hops.
+var forwardedRequestHeaders = []string{"Authorization", "Content-Type", "X-Role"}
+
+// relayedResponseHeaders are the only leader response headers copied back.
+var relayedResponseHeaders = []string{"Content-Type", "Retry-After"}
+
+// forward applies the loop, target and size rules, then relays.
+func (f *Forwarder) forward(c *gin.Context, st *requestState, target string) {
+	switch {
+	case c.GetHeader(HeaderForwarded) != "":
+		f.refuse(c, resultLoop, target)
+	case !f.allowedTarget(target):
+		f.refuse(c, resultUnconfigured, target)
+	case st.overflow:
+		f.record(c, resultTooLarge, target, http.StatusRequestEntityTooLarge, 0)
+		c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, gin.H{errorKey: CodeRequestTooLarge})
+	default:
+		f.relay(c, st, target)
+	}
+}
+
+func (f *Forwarder) relay(c *gin.Context, st *requestState, target string) {
+	start := time.Now()
+	timeout := f.timeout + time.Duration(st.waitSeconds)*time.Second
+	ctx, cancel := context.WithTimeout(c.Request.Context(), timeout)
+	defer cancel()
+
+	req, err := f.newRequest(ctx, c, st, target)
+	if err != nil {
+		f.refuse(c, resultError, target)
+		return
+	}
+	resp, err := f.client.Do(req)
+	if err != nil {
+		f.refuse(c, classify(c.Request.Context(), ctx), target)
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= http.StatusMultipleChoices && resp.StatusCode < http.StatusBadRequest {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		f.refuse(c, resultRedirect, target)
+		return
+	}
+	for _, name := range relayedResponseHeaders {
+		if v := resp.Header.Get(name); v != "" {
+			c.Writer.Header().Set(name, v)
+		}
+	}
+	c.Writer.WriteHeader(resp.StatusCode)
+	_, copyErr := io.Copy(c.Writer, resp.Body)
+	result := resultOK
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		result = resultUpstreamUnavailable
+	}
+	if copyErr != nil {
+		result = resultError
+	}
+	f.record(c, result, target, resp.StatusCode, time.Since(start))
+	c.Abort()
+}
+
+func (f *Forwarder) newRequest(ctx context.Context, c *gin.Context, st *requestState, target string) (*http.Request, error) {
+	var body io.Reader = http.NoBody
+	if len(st.body) > 0 {
+		body = bytes.NewReader(st.body)
+	}
+	req, err := http.NewRequestWithContext(ctx, c.Request.Method, targetURL(target, c.Request.URL), body)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range forwardedRequestHeaders {
+		if v := c.GetHeader(name); v != "" {
+			req.Header.Set(name, v)
+		}
+	}
+	if id := c.GetString("request_id"); id != "" {
+		req.Header.Set("X-Request-Id", id)
+	}
+	req.Header.Set(HeaderForwarded, "1")
+	return req, nil
+}
+
+func classify(parent, ctx context.Context) string {
+	switch {
+	case parent.Err() != nil:
+		return resultCanceled
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return resultTimeout
+	default:
+		return resultError
+	}
+}
+
+// refuse writes 503 leader_unavailable with Retry-After: 1. It is safe on a
+// nil Forwarder.
+func (f *Forwarder) refuse(c *gin.Context, result, target string) {
+	f.record(c, result, target, http.StatusServiceUnavailable, 0)
+	c.Header("Retry-After", retryAfterSeconds)
+	c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{errorKey: CodeLeaderUnavailable})
+}
+
+// record increments the metric and writes at most one log line. The line
+// never contains the Authorization header, the body or any token.
+func (f *Forwarder) record(c *gin.Context, result, target string, status int, elapsed time.Duration) {
+	route := c.FullPath()
+	if route == "" {
+		route = unknownRoute
+	}
+	metrics.LeaderForwardTotal.WithLabelValues(route, result).Inc()
+	logger := slog.Default()
+	if f != nil && f.logger != nil {
+		logger = f.logger
+	}
+	level := slog.LevelWarn
+	if result == resultOK {
+		level = slog.LevelDebug
+	}
+	logger.Log(c.Request.Context(), level, "leader forward",
+		"event", logEvent,
+		"route", route,
+		"method", c.Request.Method,
+		"result", result,
+		"status", status,
+		"leader", truncate(target),
+		"requestId", truncate(c.GetString("request_id")),
+		"durationMs", elapsed.Milliseconds(),
+	)
+}
+
+func truncate(s string) string {
+	if len(s) > maxLoggedValueLen {
+		return s[:maxLoggedValueLen]
+	}
+	return s
+}

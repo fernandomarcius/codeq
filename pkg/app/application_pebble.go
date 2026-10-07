@@ -20,6 +20,7 @@ import (
 	topicsapp "github.com/osvaldoandrade/codeq/internal/application/topics"
 	"github.com/osvaldoandrade/codeq/internal/cluster"
 	"github.com/osvaldoandrade/codeq/internal/cluster/clusterpb"
+	"github.com/osvaldoandrade/codeq/internal/leaderforward"
 	"github.com/osvaldoandrade/codeq/internal/middleware"
 	"github.com/osvaldoandrade/codeq/internal/providers"
 	raftpkg "github.com/osvaldoandrade/codeq/internal/raft"
@@ -496,6 +497,19 @@ func newPebbleApplication(
 				app.RaftGroups = append(app.RaftGroups, r)
 			}
 		}
+		// One leadership source per Pebble shard, i.e. per Raft group.
+		// RAFT_MUX_ENABLED only shares the transport port; it does not
+		// change the group set.
+		groups := make([]leaderforward.Leadership, len(dbs))
+		for i, d := range dbs {
+			groups[i] = d
+		}
+		app.LeaderForward = leaderforward.New(leaderforward.Config{
+			PeerHTTPAddrs: cfg.Raft.PeerHTTPAddrs,
+			SelfID:        cfg.Raft.SelfID,
+			Groups:        groups,
+			Logger:        logger,
+		})
 	}
 
 	cleanupStartupFailure := func() {

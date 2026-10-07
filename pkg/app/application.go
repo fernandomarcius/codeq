@@ -9,6 +9,7 @@ import (
 	"time"
 
 	topicsapp "github.com/osvaldoandrade/codeq/internal/application/topics"
+	"github.com/osvaldoandrade/codeq/internal/leaderforward"
 	"github.com/osvaldoandrade/codeq/internal/metrics"
 	"github.com/osvaldoandrade/codeq/internal/middleware"
 	"github.com/osvaldoandrade/codeq/internal/providers"
@@ -52,7 +53,11 @@ type Application struct {
 	RateLimiter       ratelimit.Limiter
 	// RaftGroups, when non-nil, is the per-shard raft state in raft
 	// mode. Index = shardIdx. Empty when raft is disabled.
-	RaftGroups      []RaftGroupStatus
+	RaftGroups []RaftGroupStatus
+	// LeaderForward relays follower writes to the Raft leader in-process
+	// (platform ADR-0022 C1.5). Nil when Raft is disabled; a nil
+	// forwarder passes requests through.
+	LeaderForward   *leaderforward.Forwarder
 	TracingShutdown func(context.Context) error
 }
 
