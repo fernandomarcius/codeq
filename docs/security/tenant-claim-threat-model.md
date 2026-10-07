@@ -15,6 +15,8 @@ validator to claim resolver, and resolved tenant to storage/provider keys.
 | Information disclosure | malformed tenant escapes a key prefix or selects an empty/global scope | DNS-label validation; missing/malformed values fail closed before handlers | unsafe/missing claim tests |
 | Denial of service | oversized or unexpected claim types trigger parser failure | bounded JWT parsing plus type checks; resolver never reflects raw values | fuzz tests |
 | Elevation of privilege | subject fallback overrides a bad alias | fallback only when every supported alias is absent | blank/non-string tests |
+| Information disclosure | any token reads another tenant's task or result by ID | task reads require `task.tenantId` equal to the resolved tenant; foreign and missing tasks answer identically | binding-scope e2e and controller tests |
+| Elevation of privilege | a binding-scoped workload token reaches admin, another topic, webhooks, subscriptions, gRPC streams or worker promotion | ADR 0003 claim contract and route allow-list | binding-scope unit, middleware and e2e tests |
 
 Tenant resolution occurs only after the configured validator accepts the token.
 It does not weaken route scopes, worker event types, admin scope, idempotency, or

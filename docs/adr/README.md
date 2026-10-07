@@ -54,3 +54,5 @@ Proposed → Accepted → (Superseded by NNNN | Deprecated)
 | # | Title | Status |
 |---|---|---|
 | [0001](0001-target-architecture.md) | Target architecture (layered + hexagonal) | Accepted |
+| [0002](0002-tenant-claim-resolution.md) | Resolve one canonical tenant claim | Accepted |
+| [0003](0003-binding-scoped-tokens.md) | Enforce binding-scoped tokens for workload-cluster QueueTopic bindings | Proposed |
