@@ -154,10 +154,27 @@ in-process. No client ever receives 307.
   ID, plus `X-CodeQ-Forwarded: 1`. The client never uses an environment proxy
   and never follows redirects; a 3xx answer is turned into 503. Only
   `Content-Type` and `Retry-After` are copied back.
-- **Timeout.** 10 s, or `waitSeconds` (capped at 30, like the scheduler) + 10 s
-  on `POST /tasks/claim`. Transport failure, timeout or a leader lost
-  mid-request gives 503 `leader_unavailable`. A non-idempotent create whose
-  forward timed out may have been applied; clients use `idempotencyKey`.
+- **Timeout and ambiguous outcomes.** 10 s, or `waitSeconds` (capped at 30,
+  like the scheduler) + 10 s on `POST /tasks/claim`. The answer depends on
+  whether the leader can have received the whole request:
+  - not sent (dial or TLS failure, connection refused, or the leader stopped
+    reading before the transport accepted every request byte): 503
+    `leader_unavailable` with `Retry-After: 1`, like no leader, loop and
+    unconfigured target. The leader cannot have applied it.
+  - sent, then no answer within the timeout: 504
+    `{"error":"leader_forward_timeout"}` **without** `Retry-After`.
+  - sent, then the connection failed (leader lost mid-request, reset): 502
+    `{"error":"leader_forward_interrupted"}` **without** `Retry-After`.
+
+  "Sent" means Go's `httptrace` `WroteRequest` fired without error: every
+  request byte was accepted by the transport. At most its final 4 KiB write
+  buffer may still be unflushed; that case is treated as sent (fail closed).
+  The transport never re-sends a non-idempotent forwarded request after
+  bytes were written. A 504 or 502 create may have been applied: a client
+  retries it only with the same `idempotencyKey` (replayed, tenant-bound)
+  or after reading the task state. Previously every failure was 503 with
+  `Retry-After: 1`, which invited a retry that could duplicate an applied
+  create.
 - **Loop prevention.** A request that already carries `X-CodeQ-Forwarded`
   is never forwarded again and gets 503 `leader_unavailable` with
   `Retry-After: 1`. The header carries no authority: the leader re-runs
@@ -173,7 +190,9 @@ in-process. No client ever receives 307.
 - **Observability.** `codeq_leader_forward_total{route,result}` with `route`
   a registered template and `result` one of `ok`, `upstream_unavailable`,
   `loop`, `unconfigured`, `no_leader`, `body_too_large`, `timeout`,
-  `canceled`, `error`, `redirect_refused`, `disabled`. One
+  `canceled`, `error`, `interrupted`, `redirect_refused`, `disabled`
+  (`timeout` and `canceled` count both the pre-send 503 and the post-send
+  answer; the log line's `status` tells them apart). One
   `codeq_leader_forward` log line per failed decision (debug on success) with
   route, method, result, status, leader URL, request ID and duration; never
   `Authorization`, the body or a token.
@@ -231,7 +250,10 @@ and the `Authorization` header are never logged.
 - Behavior change (C1.5): followers no longer answer 307. Clients that relied
   on following the redirect now get the leader's answer directly, or 503
   `leader_unavailable` with `Retry-After: 1`. Unknown-leader writes that
-  answered 400 or 500 now answer that 503.
+  answered 400 or 500 now answer that 503. A forward that failed after the
+  request was sent answers 504 `leader_forward_timeout` or 502
+  `leader_forward_interrupted` without `Retry-After`; SDKs must not retry
+  those blindly.
 - Residual (C1.5): the bearer token crosses one more in-cluster HTTP hop,
   follower to leader, in the same trust zone and over the same transport as
   the existing edge to `codeq:8080` hop. It goes only to configured peers.

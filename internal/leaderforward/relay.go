@@ -7,6 +7,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptrace"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -26,6 +28,7 @@ const (
 	resultCanceled            = "canceled"
 	resultError               = "error"
 	resultRedirect            = "redirect_refused"
+	resultInterrupted         = "interrupted"
 	resultDisabled            = "disabled"
 
 	logEvent          = "codeq_leader_forward"
@@ -67,12 +70,43 @@ func (f *Forwarder) relay(c *gin.Context, st *requestState, target string) {
 		f.refuse(c, resultError, target)
 		return
 	}
-	resp, err := f.client.Do(req)
+	resp, sent, err := f.send(req)
 	if err != nil {
-		f.refuse(c, classify(c.Request.Context(), ctx), target)
+		result := classify(c.Request.Context(), ctx)
+		if sent {
+			f.ambiguous(c, result, target, time.Since(start))
+			return
+		}
+		f.refuse(c, result, target)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
+	f.relayResponse(c, resp, target, start)
+}
+
+// send performs the forward and reports whether the request was sent: the
+// transport accepted every request byte for writing (httptrace WroteRequest
+// without error). From then on the leader may have applied the request, so
+// a failure is ambiguous. Up to the transport's final write buffer (4 KiB)
+// may still be unflushed at that point; that case is treated as sent (fail
+// closed). Before it (dial, TLS, connection refused, a leader that stops
+// reading mid-body) the leader cannot hold a complete request and the
+// answer stays a retryable 503.
+func (f *Forwarder) send(req *http.Request) (*http.Response, bool, error) {
+	var sent atomic.Bool
+	trace := &httptrace.ClientTrace{
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			if info.Err == nil {
+				sent.Store(true)
+			}
+		},
+	}
+	resp, err := f.client.Do(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
+	return resp, sent.Load(), err
+}
+
+// relayResponse copies the leader's answer, refusing any 3xx.
+func (f *Forwarder) relayResponse(c *gin.Context, resp *http.Response, target string, start time.Time) {
 	if resp.StatusCode >= http.StatusMultipleChoices && resp.StatusCode < http.StatusBadRequest {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		f.refuse(c, resultRedirect, target)
@@ -128,8 +162,28 @@ func classify(parent, ctx context.Context) string {
 	}
 }
 
-// refuse writes 503 leader_unavailable with Retry-After: 1. It is safe on a
-// nil Forwarder.
+// ambiguous answers a forward that failed after the whole request was sent:
+// the leader may already have applied it, so the answer never invites a
+// blind retry (no Retry-After). A timeout gives 504 leader_forward_timeout;
+// any other post-send failure (connection reset, leader lost) gives 502
+// leader_forward_interrupted. A client retries only with an idempotency key
+// or after reading the task state.
+func (f *Forwarder) ambiguous(c *gin.Context, result, target string, elapsed time.Duration) {
+	status, code := http.StatusBadGateway, CodeForwardInterrupted
+	switch result {
+	case resultTimeout:
+		status, code = http.StatusGatewayTimeout, CodeForwardTimeout
+	case resultError:
+		result = resultInterrupted
+	}
+	f.record(c, result, target, status, elapsed)
+	c.AbortWithStatusJSON(status, gin.H{errorKey: code})
+}
+
+// refuse writes 503 leader_unavailable with Retry-After: 1. It is used only
+// when the leader cannot have applied the request: no leader, loop,
+// unconfigured target, or a failure before the request was fully sent
+// (dial, connect, write). It is safe on a nil Forwarder.
 func (f *Forwarder) refuse(c *gin.Context, result, target string) {
 	f.record(c, result, target, http.StatusServiceUnavailable, 0)
 	c.Header("Retry-After", retryAfterSeconds)

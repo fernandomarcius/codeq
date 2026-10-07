@@ -12,7 +12,10 @@
 //     and X-CodeQ-Forwarded: 1 is added;
 //   - redirects are never followed and a 3xx answer is never relayed;
 //   - a request that already carries X-CodeQ-Forwarded is never forwarded
-//     again and gets 503 {"error":"leader_unavailable"} with Retry-After: 1.
+//     again and gets 503 {"error":"leader_unavailable"} with Retry-After: 1;
+//   - a failure after the request was fully sent is ambiguous (the leader
+//     may have applied it): 504 leader_forward_timeout or 502
+//     leader_forward_interrupted, never with Retry-After.
 //
 // The header carries no authority. The leader re-runs authentication and
 // every authorization rule. No client ever receives HTTP 307.
@@ -35,8 +38,19 @@ const (
 	HeaderForwarded = "X-CodeQ-Forwarded"
 
 	// CodeLeaderUnavailable is the error code of every 503 this package
-	// writes. Clients retry after Retry-After.
+	// writes. The leader cannot have applied the request; clients retry
+	// after Retry-After.
 	CodeLeaderUnavailable = "leader_unavailable"
+
+	// CodeForwardTimeout is the 504 answer when the request reached the
+	// leader and no answer came within the forward timeout. The outcome is
+	// unknown, so there is no Retry-After.
+	CodeForwardTimeout = "leader_forward_timeout"
+
+	// CodeForwardInterrupted is the 502 answer when the request reached the
+	// leader and the connection then failed (for example the leader was
+	// lost). The outcome is unknown, so there is no Retry-After.
+	CodeForwardInterrupted = "leader_forward_interrupted"
 
 	// CodeRequestTooLarge is returned when a request that must be forwarded
 	// has a body larger than MaxBodyBytes.

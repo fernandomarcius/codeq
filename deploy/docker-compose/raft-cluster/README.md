@@ -13,6 +13,10 @@ It also wires `RAFT_PEER_HTTP_ADDRS` so a write that lands on a follower
 is forwarded in-process to the leader and the client gets the leader's
 answer directly. Followers never answer `307`; when no configured leader is
 known they answer `503 {"error":"leader_unavailable"}` with `Retry-After: 1`.
+If the forwarded request already reached the leader and then timed out or the
+connection broke, the outcome is unknown: `504 {"error":"leader_forward_timeout"}`
+or `502 {"error":"leader_forward_interrupted"}`, without `Retry-After`; retry
+only with the same `idempotencyKey`.
 
 See [`docs/40-raft-replication.md`](../../../docs/40-raft-replication.md)
 for the architecture, configuration knobs, status endpoint, and current

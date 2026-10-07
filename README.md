@@ -171,7 +171,9 @@ policy returns `400`.
 The catalog is durable in Redis and standalone Pebble. In Raft mode, topic
 writes flow through the shard-0 replicated FSM, followers forward writes
 in-process to a leader configured in `RAFT_PEER_HTTP_ADDRS` (never `307`; `503`
-`leader_unavailable` when no configured leader is known), and snapshots include
+`leader_unavailable` when no configured leader is known; `504`/`502` without
+`Retry-After` when a forwarded request reached the leader and its outcome is
+unknown), and snapshots include
 the catalog. Keep
 `raft.topicCatalogProtocol` empty while upgrading every peer; topic operations
 then fail closed with `503`. After every peer runs a compatible build, set the
