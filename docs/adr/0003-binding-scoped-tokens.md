@@ -3,7 +3,7 @@
 - **Status**: Proposed (implementation of platform ADR-0022, accepted by the owner on 2026-10-07; independent review pending)
 - **Date**: 2026-10-07
 - **Deciders**: Osvaldo Andrade
-- **Tracks**: Code Foundry CFP-070, customer issue #33; platform ADR-0022 contract C1
+- **Tracks**: Code Foundry CFP-070, customer issue #33; platform ADR-0022 contracts C1.1-C1.5 (revision after architecture review 1)
 
 ## Context
 
@@ -40,7 +40,10 @@ hold, else every route answers 403 `{"error":"binding_scope_denied"}`:
 
 The producer, worker and any-token middlewares run the check right after
 authentication and before tenant resolution, then apply one route allow-list
-keyed on the registered route template and method:
+keyed on the registered route template and method. The status codes below are
+the ones a client receives, given which group authenticates each route (the
+producer validator accepts only `aud=codeq-producer`, the worker validator only
+`aud=codeq-worker`, and `/admin` authenticates with the producer validator):
 
 | Route | Publish | Subscribe |
 |---|---|---|
@@ -50,7 +53,7 @@ keyed on the registered route template and method:
 | `POST /v1/codeq/tasks/claim`, `/claim/batch` | 401 | commands subset of `eventTypes` |
 | `POST /v1/codeq/tasks/:id/{heartbeat,abandon,nack,result}` | 401 | tenant, command and `WorkerID == sub`, else 403 `not-owner` |
 | `POST /v1/codeq/tasks/batch/results` | 401 | per item, refused items get `not-owner` |
-| `POST /v1/codeq/workers/subscriptions[/:id/heartbeat]` | 403 `route_not_allowed` | 403 `route_not_allowed` |
+| `POST /v1/codeq/workers/subscriptions[/:id/heartbeat]` | 401 (worker audience; never promoted) | 403 `route_not_allowed` |
 | `GET /v1/codeq/raft/status` | allowed | allowed |
 | `/v1/codeq/admin/**` | 403 `route_not_allowed` before `RequireAdmin` | 401 |
 | worker and producer gRPC streams | `PermissionDenied route_not_allowed` | same |
@@ -60,8 +63,81 @@ token. A binding-scoped token never takes a role from the dev `X-Role` header.
 
 Independently of token kind, `GET /v1/codeq/tasks/:id` and
 `GET /v1/codeq/tasks/:id/result` now return a task only when its `tenantId`
-equals the token's resolved tenant. A foreign task is answered exactly like a
-missing one (same status and body, no long-poll).
+equals the token's resolved tenant (platform follow-up F1, done here). A
+foreign task is answered exactly like a missing one (same status and body, no
+long-poll): `GET /tasks/:id` gives 404 `{"error":"not found"}` and
+`GET /tasks/:id/result` keeps its existing missing-task body, 404
+`{"error":"task not found"}`. Platform ADR-0022 C1.2 writes
+`{"error":"not found"}` for both; codeQ keeps the existing result body because
+changing only the foreign case would create the existence oracle C1.2 forbids,
+and changing the missing case would break existing clients.
+
+The JWKS validator enforces `exp` with zero leeway (`jwt.Parse` without
+`WithLeeway`), so an issued token is usable for at most its 300 s lifetime;
+the platform keeps 360 s as the conservative revocation bound (C1.4).
+
+### Leader forwarding (platform ADR-0022 C1.5)
+
+codeQ runs three Raft voters behind one ClusterIP Service. A follower used to
+answer writes with HTTP 307 to the leader's in-cluster `RAFT_PEER_HTTP_ADDRS`
+URL, which a workload cluster cannot resolve, and batch writes on a follower
+failed per item or with 500. `internal/leaderforward` now forwards the request
+in-process. No client ever receives 307.
+
+- **Target.** Only a value of the configured `RAFT_PEER_HTTP_ADDRS` map, by
+  exact string, other than this node's own URL. Malformed values (not an
+  absolute `http`/`https` URL, or with userinfo, query or fragment) are
+  excluded at startup. Any other hint, including an unknown leader during an
+  election, gives 503 `{"error":"leader_unavailable"}` with `Retry-After: 1`.
+- **Request.** Same method, escaped path and query, the buffered body, and
+  only `Authorization`, `Content-Type`, the dev-only `X-Role` and the request
+  ID, plus `X-CodeQ-Forwarded: 1`. The client never uses an environment proxy
+  and never follows redirects; a 3xx answer is turned into 503. Only
+  `Content-Type` and `Retry-After` are copied back.
+- **Timeout.** 10 s, or `waitSeconds` (capped at 30, like the scheduler) + 10 s
+  on `POST /tasks/claim`. Transport failure, timeout or a leader lost
+  mid-request gives 503 `leader_unavailable`. A non-idempotent create whose
+  forward timed out may have been applied; clients use `idempotencyKey`.
+- **Loop prevention.** A request that already carries `X-CodeQ-Forwarded`
+  is never forwarded again and gets 503 `leader_unavailable` with
+  `Retry-After: 1`. The header carries no authority: the leader re-runs
+  authentication, the binding allow-list and every controller rule.
+- **Order.** The gate runs after authentication, the binding allow-list and
+  worker scope checks (a follower never forwards an unauthenticated or
+  route-refused request) and before rate limiting and the controller (the
+  leader counts the request once).
+- **Body.** Bodies up to 16 MiB are buffered for replay. A larger body that
+  must be forwarded gets 413 `{"error":"request_too_large"}`; the leader
+  applies no new limit. codeQ had no task-route body limit before, so this
+  is the limit the platform ADR's "existing limits" resolves to.
+- **Observability.** `codeq_leader_forward_total{route,result}` with `route`
+  a registered template and `result` one of `ok`, `upstream_unavailable`,
+  `loop`, `unconfigured`, `no_leader`, `body_too_large`, `timeout`,
+  `canceled`, `error`, `redirect_refused`, `disabled`. One
+  `codeq_leader_forward` log line per failed decision (debug on success) with
+  route, method, result, status, leader URL, request ID and duration; never
+  `Authorization`, the body or a token.
+
+**Which Raft group decides.** There is one Raft group per Pebble shard.
+`RAFT_MUX_ENABLED` only shares the Raft transport port; it does not change
+the group set. Both installations run one shard with mux enabled, so every
+route is governed by that single group. With `numShards > 1`:
+
+| Route | Group touched | Gate before the controller | After the controller |
+|---|---|---|---|
+| `POST /tasks` | `hash(new task ID)`, unknown in advance | forward when one peer leads every group, else local | the exact group's not-leader hint is forwarded |
+| `/tasks/:id/{heartbeat,abandon,nack,result}` | `hash(task ID)` | same | same |
+| `PUT`/`DELETE /admin/topics/:name` | group 0 | same | same |
+| `/tasks/claim`, `/tasks/claim/batch` | every group this node leads (fan-out) | local when this node leads at least one group; forward when one peer leads every group; else 503 | `/claim/batch` forwards only when nothing was claimed |
+| `/tasks/batch`, `/tasks/batch/results` | per item, `hash(ID)` | same as claims, before any item | per-item results (legacy) |
+
+So a batch on a node that leads no group is forwarded whole when one peer
+leads every group and is refused with 503 (retryable, nothing processed) when
+leadership is split; a node that leads at least one group keeps the legacy
+per-item results, where items for groups it does not lead report `not leader`.
+A forwarded single create can still meet a group led by a third node and then
+gets 503, because the leader never forwards again. Single-shard installations
+are not affected by these split-leadership cases.
 
 Refusals increment `codeq_binding_scope_denied_total{reason,route}` (bounded
 labels) and write one `codeq_binding_scope_denied` log line with code, reason,
@@ -85,6 +161,13 @@ and the `Authorization` header are never logged.
   and wait 360 s.
 - Webhooks and subscriptions remain unrestricted for legacy tokens; general
   URL egress validation is follow-up work.
+- Behavior change (C1.5): followers no longer answer 307. Clients that relied
+  on following the redirect now get the leader's answer directly, or 503
+  `leader_unavailable` with `Retry-After: 1`. Unknown-leader writes that
+  answered 400 or 500 now answer that 503.
+- Residual (C1.5): the bearer token crosses one more in-cluster HTTP hop,
+  follower to leader, in the same trust zone and over the same transport as
+  the existing edge to `codeq:8080` hop. It goes only to configured peers.
 
 ## Alternatives considered
 

@@ -17,6 +17,12 @@ validator to claim resolver, and resolved tenant to storage/provider keys.
 | Elevation of privilege | subject fallback overrides a bad alias | fallback only when every supported alias is absent | blank/non-string tests |
 | Information disclosure | any token reads another tenant's task or result by ID | task reads require `task.tenantId` equal to the resolved tenant; foreign and missing tasks answer identically | binding-scope e2e and controller tests |
 | Elevation of privilege | a binding-scoped workload token reaches admin, another topic, webhooks, subscriptions, gRPC streams or worker promotion | ADR 0003 claim contract and route allow-list | binding-scope unit, middleware and e2e tests |
+| Information disclosure | a follower forwards the bearer token to a host chosen by a request or a stale/forged leader hint (SSRF) | target must equal a configured `RAFT_PEER_HTTP_ADDRS` value other than self; malformed peers excluded; no environment proxy; no redirects followed | leaderforward unit tests (unconfigured, trailing slash, self, empty, malformed, redirect) |
+| Spoofing / elevation of privilege | client sends `X-CodeQ-Forwarded` to skip checks on the leader | the header carries no authority; the leader re-runs authentication, the binding allow-list and controller rules; on a follower it only yields 503 | three-voter test: forged header with bad token is 401, cross-tenant heartbeat is `not-owner` |
+| Denial of service | forwarding loop or amplification between voters | one hop only: a forwarded request is never forwarded again (503 `leader_unavailable`, `Retry-After: 1`); per-request timeout 10 s (claims `waitSeconds` + 10 s) | loop tests on single, batch and claim routes |
+| Denial of service | large bodies buffered for replay | at most 16 MiB buffered; larger bodies that must be forwarded get 413; unauthenticated requests are refused before the gate | body-limit unit and cluster tests |
+| Information disclosure | forwarding logs or metrics leak credentials | one bounded log line per decision without `Authorization`, body or token; metric labels are route templates and fixed results | log-redaction unit test |
+| Information disclosure (residual) | the bearer token crosses one more in-cluster HTTP hop (follower to leader) | same trust zone and transport as the existing edge to `codeq:8080` hop; configured peers only | accepted residual, platform ADR-0022 C1.5 |
 
 Tenant resolution occurs only after the configured validator accepts the token.
 It does not weaken route scopes, worker event types, admin scope, idempotency, or

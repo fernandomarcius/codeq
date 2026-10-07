@@ -9,10 +9,10 @@ every shard's raft group shares one TCP port per node — only port
 8080 (HTTP) and 7000 (raft) are exposed on each container, regardless
 of how many shards are configured.
 
-It also wires `RAFT_PEER_HTTP_ADDRS` so server-side 307 redirects work
-out of the box: a write that lands on a follower comes back as
-`307 Temporary Redirect` with `Location: <leader URL>`. Standard HTTP
-clients follow automatically.
+It also wires `RAFT_PEER_HTTP_ADDRS` so a write that lands on a follower
+is forwarded in-process to the leader and the client gets the leader's
+answer directly. Followers never answer `307`; when no configured leader is
+known they answer `503 {"error":"leader_unavailable"}` with `Retry-After: 1`.
 
 See [`docs/40-raft-replication.md`](../../../docs/40-raft-replication.md)
 for the architecture, configuration knobs, status endpoint, and current
