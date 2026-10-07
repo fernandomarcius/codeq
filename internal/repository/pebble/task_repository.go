@@ -15,6 +15,7 @@ import (
 
 	"github.com/osvaldoandrade/codeq/internal/backoff"
 	"github.com/osvaldoandrade/codeq/internal/metrics"
+	"github.com/osvaldoandrade/codeq/internal/repository"
 	"github.com/osvaldoandrade/codeq/pkg/domain"
 )
 
@@ -202,13 +203,16 @@ func (r *TaskRepository) EnqueueWithReady(ctx context.Context, cmd domain.Comman
 func (r *TaskRepository) EnqueueWithID(ctx context.Context, id string, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey string, visibleAt time.Time, tenantID string) (*domain.Task, bool, error) {
 	if idempotencyKey != "" {
 		// Look up existing task for this idempotency key. If present, return
-		// the original task (mirrors the Redis behavior so SDKs see the same
-		// idempotent contract regardless of backend).
+		// the original task to a caller of the same tenant only (mirrors the
+		// Redis behavior so SDKs see the same idempotent contract regardless
+		// of backend). A caller of another tenant gets
+		// domain.ErrIdempotencyConflict and never the task.
 		if existing, err := r.db.Get(KeyIdempo(idempotencyKey)); err == nil {
 			existingID := string(existing)
 			task, ferr := r.Get(ctx, existingID)
 			if ferr == nil {
-				return task, false, nil
+				replay, rerr := repository.ReplayIdempotent(task, tenantID)
+				return replay, false, rerr
 			}
 			// Idempo points to a deleted task: fall through and recreate.
 		} else if !errors.Is(err, ErrNotFound) {

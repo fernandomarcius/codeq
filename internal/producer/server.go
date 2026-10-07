@@ -233,6 +233,11 @@ func (s *Server) processCreate(ctx context.Context, sess *streamSession, req *pr
 	if req.DelaySeconds < 0 {
 		return &producerpb.CreateAck{Seq: req.Seq, Ok: false, ErrorMessage: "delaySeconds must be >= 0"}
 	}
+	// NUL separates binding idempotency namespaces (ADR 0003); no client key
+	// may contain it, on any transport.
+	if strings.Contains(req.IdempotencyKey, "\x00") {
+		return &producerpb.CreateAck{Seq: req.Seq, Ok: false, ErrorMessage: "invalid 'idempotencyKey'"}
+	}
 	var runAt time.Time
 	if req.RunAt != nil {
 		runAt = req.RunAt.AsTime()

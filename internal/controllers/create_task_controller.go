@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"errors"
 	"net/http"
 	"time"
 
@@ -34,11 +35,16 @@ func (h *createTaskController) Handle(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
-	if scope, ok := middleware.GetBindingScope(c); ok {
+	scope, _ := middleware.GetBindingScope(c)
+	if scope != nil {
 		if code, reason := publishDenial(scope, req.Command, req.Webhook); code != "" {
 			middleware.DenyBinding(c, scope, http.StatusForbidden, code, reason, nil)
 			return
 		}
+	}
+	if !validIdempotencyKey(req.Idempotency) {
+		c.JSON(http.StatusBadRequest, gin.H{errorField: errInvalidIdempotency})
+		return
 	}
 	payloadJSON, _ := jsonMarshal(req.Payload)
 
@@ -64,7 +70,12 @@ func (h *createTaskController) Handle(c *gin.Context) {
 		}
 	}
 
-	task, err := h.svc.CreateTask(c.Request.Context(), req.Command, payloadJSON, req.Priority, req.Webhook, req.MaxAttempts, req.Idempotency, runAt, req.DelaySecs, tenantID)
+	idempotencyKey := storageIdempotencyKey(scope, req.Idempotency)
+	task, err := h.svc.CreateTask(c.Request.Context(), req.Command, payloadJSON, req.Priority, req.Webhook, req.MaxAttempts, idempotencyKey, runAt, req.DelaySecs, tenantID)
+	if errors.Is(err, domain.ErrIdempotencyConflict) || (err == nil && !bindingMayReplay(scope, task)) {
+		respondIdempotencyConflict(c, tenantID)
+		return
+	}
 	if err != nil {
 		respondWriteError(c, err)
 		return

@@ -126,6 +126,11 @@ func (r *TaskRouter) EnqueueWithReady(ctx context.Context, cmd domain.Command, p
 		TenantId:       tenantID,
 	})
 	if err != nil {
+		// The owner's ErrIdempotencyConflict crosses gRPC as a message;
+		// restore the sentinel so the HTTP layer answers 409 with no task.
+		if errMessageHas(err, domain.ErrIdempotencyConflict.Error()) {
+			return nil, false, domain.ErrIdempotencyConflict
+		}
 		return nil, false, err
 	}
 	return protoToDomainTask(resp.Task), resp.Ready, nil

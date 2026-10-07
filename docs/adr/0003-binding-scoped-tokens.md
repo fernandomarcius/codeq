@@ -72,6 +72,66 @@ long-poll): `GET /tasks/:id` gives 404 `{"error":"not found"}` and
 changing only the foreign case would create the existence oracle C1.2 forbids,
 and changing the missing case would break existing clients.
 
+### Idempotency keys (C1.2: no cross-tenant replay, no oracle with data)
+
+The idempotency index used to be global: `idempo:<key>` with no tenant or
+command. A task created by one tenant was returned, with payload and
+`tenantId`, to any token of another tenant that sent the same
+`idempotencyKey`. Now:
+
+- **Replay is tenant-bound for every token kind.** When a key already maps
+  to a task, every backend (Pebble, sharded Pebble, Redis, and the cluster
+  router, which maps the owner's answer back) returns it only when
+  `task.tenantId` equals the caller's resolved tenant, by exact match
+  (including the empty legacy tenant). Otherwise `POST /v1/codeq/tasks`
+  answers 409 `{"error":"idempotency_conflict"}` with no task, no ID and
+  nothing enqueued; a `POST /tasks/batch` item gets
+  `{"error":"idempotency_conflict"}` and no `task`; a producer-stream
+  `CreateAck` gets `ok=false`, `errorMessage="idempotency_conflict"` and no
+  `taskId`. Same-tenant replay is unchanged: the original task is returned
+  even when the replayed request differs.
+- **Binding keys are namespaced.** For a Publish binding token the stored key
+  is exactly
+
+  ```
+  tid + "\x00" + eventType + "\x00" + idempotencyKey
+  ```
+
+  with `tid` and `eventType` taken from the verified token (both restricted
+  to `[a-z0-9-]`, so never NUL). Two topics of one tenant never collide, a
+  binding key never collides with another tenant's key, and the reviewer's
+  probe (a binding token of another tenant reusing a key) creates its own task
+  instead of seeing the foreign one. Every other token kind keeps the client
+  key unchanged. As defence in depth, a create that returns to a binding token
+  a task of another tenant or command is answered with the same 409.
+- **NUL is refused in client keys** for every token kind (400
+  `{"error":"invalid 'idempotencyKey'"}`; per item in a batch), so no caller
+  can write a key inside a binding namespace.
+- **Sharded Pebble.** With an idempotency key the new task ID is drawn on the
+  key's shard (`shardOf(id) == shardOf(key)`), so the task and its index are
+  written by one batch on the shard the replay reads. Previously, with more
+  than one shard, the index landed on the task's shard and same-tenant replay
+  could miss. One-shard installations are unaffected.
+- **Observability.** `codeq_idempotency_conflict_total{route,kind}` (`kind` is
+  `binding` or `token`) and one `codeq_idempotency_conflict` warning line with
+  route, method, caller tenant, request ID and, for binding tokens, topic and
+  binding UID; never the key, task ID, payload or token.
+
+**Migration.** No data migration and no new key format for legacy tokens.
+Existing `idempo:` entries keep their raw keys and expire with task retention:
+static, admin and other non-binding tokens send the same raw key and still
+replay within their own tenant; a cross-tenant hit on an existing entry now
+answers 409 instead of the task. Binding keys stored before this change (none
+in practice: Tikti does not issue binding tokens yet) would not be found under
+the namespace, so a retry spanning the upgrade would create one new task. The
+tenant check is effective once the node that executes the create (the Raft
+leader after C1.5 forwarding) runs this version.
+
+**Residual.** Legacy keys stay in one global namespace, so a non-binding token
+of another tenant learns one bit — that the raw key exists — from the 409, but
+never the task, its ID or its tenant. Namespacing legacy keys by tenant needs a
+dual-read migration of existing entries and is follow-up work.
+
 The JWKS validator enforces `exp` with zero leeway (`jwt.Parse` without
 `WithLeeway`), so an issued token is usable for at most its 300 s lifetime;
 the platform keeps 360 s as the conservative revocation bound (C1.4).
@@ -161,6 +221,13 @@ and the `Authorization` header are never logged.
   and wait 360 s.
 - Webhooks and subscriptions remain unrestricted for legacy tokens; general
   URL egress validation is follow-up work.
+- Behavior change (idempotency): reusing another tenant's `idempotencyKey`
+  answers 409 `idempotency_conflict` instead of returning that tenant's task,
+  and a key containing NUL is refused with 400. Clients that shared keys
+  across tenants must use distinct keys.
+- Rolling back codeQ re-opens the global idempotency replay and drops the
+  binding namespace (binding retries across the rollback create new tasks):
+  disable Tikti binding issuance first, as above.
 - Behavior change (C1.5): followers no longer answer 307. Clients that relied
   on following the redirect now get the leader's answer directly, or 503
   `leader_unavailable` with `Retry-After: 1`. Unknown-leader writes that

@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"errors"
 	"net/http"
 	"time"
 
@@ -41,6 +42,7 @@ func (h *batchCreateTaskController) Handle(c *gin.Context) {
 	if denyBindingBatch(c, req.Tasks) {
 		return
 	}
+	scope, _ := middleware.GetBindingScope(c)
 
 	tenantID := ""
 	if v, ok := c.Get("tenantID"); ok {
@@ -70,8 +72,19 @@ func (h *batchCreateTaskController) Handle(c *gin.Context) {
 			results[i] = batchCreateResult{Error: "invalid 'delaySeconds' (must be >= 0)"}
 			continue
 		}
+		if !validIdempotencyKey(t.Idempotency) {
+			results[i] = batchCreateResult{Error: errInvalidIdempotency}
+			continue
+		}
 
-		task, err := h.svc.CreateTask(c.Request.Context(), t.Command, payloadJSON, t.Priority, t.Webhook, t.MaxAttempts, t.Idempotency, runAt, t.DelaySecs, tenantID)
+		idempotencyKey := storageIdempotencyKey(scope, t.Idempotency)
+		task, err := h.svc.CreateTask(c.Request.Context(), t.Command, payloadJSON, t.Priority, t.Webhook, t.MaxAttempts, idempotencyKey, runAt, t.DelaySecs, tenantID)
+		if errors.Is(err, domain.ErrIdempotencyConflict) || (err == nil && !bindingMayReplay(scope, task)) {
+			// Per-item 409 equivalent: the stable code and never the task.
+			recordIdempotencyConflict(c, tenantID)
+			results[i] = batchCreateResult{Error: codeIdempotencyConflict}
+			continue
+		}
 		if err != nil {
 			results[i] = batchCreateResult{Error: err.Error()}
 			continue

@@ -328,7 +328,9 @@ func (r *taskRedisRepo) enqueueIdempotent(ctx context.Context, cmd domain.Comman
 			if r.idempoBloom != nil {
 				r.idempoBloom.Add(idempotencyKey)
 			}
-			return task, false, nil
+			// Same tenant only; any other caller gets 409 and no task.
+			replay, rerr := ReplayIdempotent(task, tenantID)
+			return replay, false, rerr
 		}
 		_ = r.rdb.Del(ctx, idKey).Err()
 	}
@@ -343,7 +345,8 @@ func (r *taskRedisRepo) enqueueIdempotent(ctx context.Context, cmd domain.Comman
 				if r.idempoBloom != nil {
 					r.idempoBloom.Add(idempotencyKey)
 				}
-				return task, false, nil
+				replay, rerr := ReplayIdempotent(task, tenantID)
+				return replay, false, rerr
 			}
 		}
 		return nil, false, fmt.Errorf("idempotency conflict")

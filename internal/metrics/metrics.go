@@ -2,7 +2,11 @@ package metrics
 
 import "github.com/prometheus/client_golang/prometheus"
 
-const namespace = "codeq"
+const (
+	namespace = "codeq"
+	// labelRoute is the bounded route-template label shared by several vectors.
+	labelRoute = "route"
+)
 
 var (
 	TaskCreatedTotal = prometheus.NewCounterVec(
@@ -78,7 +82,7 @@ var (
 			Name:      "binding_scope_denied_total",
 			Help:      "Total number of refused binding-scoped token requests, labeled by reason and route.",
 		},
-		[]string{"reason", "route"},
+		[]string{"reason", labelRoute},
 	)
 
 	// LeaderForwardTotal counts follower-to-leader forwarding decisions
@@ -90,7 +94,20 @@ var (
 			Name:      "leader_forward_total",
 			Help:      "Total number of follower-to-leader request forwards, labeled by route and result.",
 		},
-		[]string{"route", "result"},
+		[]string{labelRoute, "result"},
+	)
+
+	// IdempotencyConflictTotal counts create requests refused with 409
+	// idempotency_conflict because the key already maps to a task the caller
+	// may not replay (another tenant, or another topic for a binding token).
+	// route is a registered route template; kind is "binding" or "token".
+	IdempotencyConflictTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "idempotency_conflict_total",
+			Help:      "Total number of create requests refused because the idempotency key belongs to another tenant or topic.",
+		},
+		[]string{labelRoute, "kind"},
 	)
 )
 
@@ -105,5 +122,6 @@ func init() {
 		RateLimitHitsTotal,
 		BindingScopeDeniedTotal,
 		LeaderForwardTotal,
+		IdempotencyConflictTotal,
 	)
 }

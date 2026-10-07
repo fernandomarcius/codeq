@@ -86,14 +86,35 @@ func (s *ShardedTaskRepository) EnqueueWithReady(ctx context.Context, cmd domain
 			tShard := s.shardOf(existingID)
 			task, ferr := s.shards[tShard].Get(ctx, existingID)
 			if ferr == nil {
-				return task, false, nil
+				// Same tenant only; any other caller gets 409 and no task.
+				replay, rerr := repository.ReplayIdempotent(task, tenantID)
+				return replay, false, rerr
 			}
 		}
 	}
-	// Pick an ID and dispatch to its owning shard.
+	// Pick an ID and dispatch to its owning shard. With an idempotency key
+	// the ID is chosen on the key's shard, so the task and its idempotency
+	// index are written by one batch on the shard the next replay reads.
 	id := uuid.NewString()
+	if idempotencyKey != "" {
+		id = s.idOnShard(s.shardOf(idempotencyKey))
+	}
 	tShard := s.shardOf(id)
 	return s.shards[tShard].EnqueueWithID(ctx, id, cmd, payload, priority, webhook, maxAttempts, idempotencyKey, visibleAt, tenantID)
+}
+
+// maxShardIDAttempts bounds idOnShard. With N shards one attempt succeeds
+// with probability 1/N, so a miss after this many attempts is negligible.
+const maxShardIDAttempts = 1024
+
+// idOnShard returns a fresh UUID owned by shard idx (expected N draws). It
+// keeps the invariant that every key of a task lives on shardOf(task ID).
+func (s *ShardedTaskRepository) idOnShard(idx int) string {
+	id := uuid.NewString()
+	for i := 0; i < maxShardIDAttempts && s.shardOf(id) != idx; i++ {
+		id = uuid.NewString()
+	}
+	return id
 }
 
 func (s *ShardedTaskRepository) Claim(ctx context.Context, workerID string, commands []domain.Command, leaseSeconds int, inspectLimit int, maxAttemptsDefault int, tenantID string) (*domain.Task, bool, error) {

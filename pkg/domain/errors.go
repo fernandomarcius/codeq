@@ -1,5 +1,7 @@
 package domain
 
+import "errors"
+
 // LeaderHint is satisfied by errors that carry a hint pointing at the
 // raft group's current leader (HTTP base URL, e.g. "http://node-2:8080").
 // The HTTP layer uses errors.As against this interface to detect a
@@ -12,3 +14,10 @@ type LeaderHint interface {
 	error
 	LeaderHTTPAddr() string
 }
+
+// ErrIdempotencyConflict is returned by every TaskRepository backend when an
+// idempotency key already maps to a task of a different tenant. The caller
+// receives neither the task nor its ID (platform ADR-0022 C1.2: no
+// cross-tenant existence oracle with data). Its message is the stable wire
+// code the HTTP layer answers with 409.
+var ErrIdempotencyConflict = errors.New("idempotency_conflict")
