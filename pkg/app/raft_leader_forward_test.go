@@ -34,6 +34,8 @@ const (
 	fwdCommand     = "GENERATE_MASTER"
 	fwdRetryAfter  = "Retry-After"
 	fwdUnavailable = leaderforward.CodeLeaderUnavailable
+	fwdTimeout     = leaderforward.CodeForwardTimeout
+	fwdInterrupted = leaderforward.CodeForwardInterrupted
 	fwdBatchPath   = pathTasks + "/batch"
 	fwdBatchClaim  = pathClaim + "/batch"
 	fwdBatchResult = pathTasks + "/batch/results"
@@ -271,6 +273,11 @@ func (c *fwdCluster) expect(r fwdResp, status int, errCode, label string) {
 	if errCode == fwdUnavailable && r.header.Get(fwdRetryAfter) != "1" {
 		c.t.Fatalf("%s: Retry-After = %q", label, r.header.Get(fwdRetryAfter))
 	}
+	// An ambiguous outcome (the leader may have applied the request) never
+	// invites a blind retry.
+	if (errCode == fwdTimeout || errCode == fwdInterrupted) && r.header.Get(fwdRetryAfter) != "" {
+		c.t.Fatalf("%s: ambiguous answer carries Retry-After %q", label, r.header.Get(fwdRetryAfter))
+	}
 }
 
 func (c *fwdCluster) create(node int, token, command string) string {
@@ -418,7 +425,11 @@ func scrapeForward(t *testing.T, route, result string) float64 {
 	return 0
 }
 
-func TestLeaderForward_LeaderLossMidRequestIsRetryable(t *testing.T) {
+// TestLeaderForward_LeaderLossMidRequestIsAmbiguous: the forwarded request
+// already reached the leader when it was lost, so the follower cannot know
+// whether it was applied. It answers 502 leader_forward_interrupted without
+// Retry-After, fast; requests that cannot have reached a leader keep 503.
+func TestLeaderForward_LeaderLossMidRequestIsAmbiguous(t *testing.T) {
 	c := startForwardCluster(t, fwdOptions{shards: 1, httpPeers: true, base: staticForwardConfig})
 	leader := c.waitLeaderOfAll(10 * time.Second)
 	f := c.others(leader)
@@ -429,7 +440,7 @@ func TestLeaderForward_LeaderLossMidRequestIsRetryable(t *testing.T) {
 	time.Sleep(700 * time.Millisecond) // the forwarded long-poll is now waiting on the leader
 	c.nodes[leader].stop()
 	r := <-done
-	c.expect(r, http.StatusServiceUnavailable, fwdUnavailable, "leader lost mid-request")
+	c.expect(r, http.StatusBadGateway, fwdInterrupted, "leader lost mid-request")
 	if time.Since(start) >= 8*time.Second {
 		t.Fatalf("follower waited %s instead of failing fast", time.Since(start))
 	}

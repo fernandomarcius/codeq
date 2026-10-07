@@ -277,7 +277,8 @@ func TestTimeoutAndClaimWaitExtension(t *testing.T) {
 	})
 	f := newForwarder(t, leader.URL, []Leadership{follower(leader.URL)}, nil)
 	f.timeout = 100 * time.Millisecond
-	expectUnavailable(t, do(engine(f.Single(), nil), testRoute, `{}`, nil), "timeout")
+	// The request reached the leader before the timeout: ambiguous, 504.
+	expectAmbiguous(t, do(engine(f.Single(), nil), testRoute, `{}`, nil), http.StatusGatewayTimeout, CodeForwardTimeout, "timeout")
 	// waitSeconds=1 extends the claim budget to 1.1 s.
 	rec := do(engine(f.Claim(), nil), testRoute+"/claim", `{"waitSeconds":1}`, nil)
 	if rec.Code != http.StatusAccepted {
