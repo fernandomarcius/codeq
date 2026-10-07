@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/osvaldoandrade/codeq/internal/middleware"
@@ -61,7 +62,7 @@ func (h *batchSubmitResultController) Handle(c *gin.Context) {
 	}
 
 	// Use batch submit for optimized RTT reduction
-	responses, err := h.svc.BatchSubmit(c.Request.Context(), items)
+	responses, err := h.submitAuthorized(c, items)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "batch submit failed"})
 		return
@@ -78,4 +79,42 @@ func (h *batchSubmitResultController) Handle(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"results": batchResults})
+}
+
+// submitAuthorized submits the batch. For a Subscribe-binding token every
+// item is first checked with the strict binding owner rule; refused items get
+// the per-item error not-owner and are never submitted, preserving the
+// route's per-item result semantics. Other token kinds are unchanged.
+func (h *batchSubmitResultController) submitAuthorized(c *gin.Context, items []domain.BatchSubmitItem) ([]domain.BatchSubmitResponse, error) {
+	scope, ok := middleware.GetBindingScope(c)
+	if !ok {
+		return h.svc.BatchSubmit(c.Request.Context(), items)
+	}
+	lookup := resultsLookup(h.svc.Get)
+	responses := make([]domain.BatchSubmitResponse, len(items))
+	allowed := make([]domain.BatchSubmitItem, 0, len(items))
+	positions := make([]int, 0, len(items))
+	for i, item := range items {
+		if !bindingOwnsTask(scope, lookup(c.Request.Context(), item.TaskID)) {
+			middleware.RecordBindingDenial(reasonNotOwner, c.FullPath())
+			responses[i] = domain.BatchSubmitResponse{TaskID: item.TaskID, Error: middleware.CodeNotOwner}
+			continue
+		}
+		allowed = append(allowed, item)
+		positions = append(positions, i)
+	}
+	if len(allowed) == 0 {
+		return responses, nil
+	}
+	submitted, err := h.svc.BatchSubmit(c.Request.Context(), allowed)
+	if err != nil {
+		return nil, err
+	}
+	if len(submitted) != len(allowed) {
+		return nil, errors.New("batch submit returned a mismatched result count")
+	}
+	for j, response := range submitted {
+		responses[positions[j]] = response
+	}
+	return responses, nil
 }

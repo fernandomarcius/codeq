@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/osvaldoandrade/codeq/internal/middleware"
 	"github.com/osvaldoandrade/codeq/internal/services"
 	"github.com/osvaldoandrade/codeq/pkg/domain"
 
@@ -32,6 +33,12 @@ func (h *createTaskController) Handle(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
+	}
+	if scope, ok := middleware.GetBindingScope(c); ok {
+		if code, reason := publishDenial(scope, req.Command, req.Webhook); code != "" {
+			middleware.DenyBinding(c, scope, http.StatusForbidden, code, reason, nil)
+			return
+		}
 	}
 	payloadJSON, _ := jsonMarshal(req.Payload)
 

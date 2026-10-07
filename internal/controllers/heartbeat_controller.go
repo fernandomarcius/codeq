@@ -31,6 +31,9 @@ func (h *heartbeatController) Handle(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing worker claims"})
 		return
 	}
+	if denyUnlessBindingOwner(c, taskID, schedulerLookup(h.svc.GetTask)) {
+		return
+	}
 	if err := h.svc.Heartbeat(c.Request.Context(), taskID, claims.Subject, req.ExtendSeconds); err != nil {
 		if maybeRedirectLeader(c, err) {
 			return

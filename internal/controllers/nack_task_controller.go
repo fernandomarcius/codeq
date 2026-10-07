@@ -32,6 +32,9 @@ func (h *nackController) Handle(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing worker claims"})
 		return
 	}
+	if denyUnlessBindingOwner(c, taskID, schedulerLookup(h.svc.GetTask)) {
+		return
+	}
 	delay, movedToDLQ, err := h.svc.NackTask(c.Request.Context(), taskID, claims.Subject, req.DelaySeconds, req.Reason)
 	if err != nil {
 		if maybeRedirectLeader(c, err) {

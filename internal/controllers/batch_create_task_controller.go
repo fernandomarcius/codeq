@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/osvaldoandrade/codeq/internal/middleware"
 	"github.com/osvaldoandrade/codeq/internal/services"
 	"github.com/osvaldoandrade/codeq/pkg/domain"
 
@@ -35,6 +36,9 @@ func (h *batchCreateTaskController) Handle(c *gin.Context) {
 	}
 	if len(req.Tasks) > maxBatchCreateSize {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "batch size exceeds maximum of 100"})
+		return
+	}
+	if denyBindingBatch(c, req.Tasks) {
 		return
 	}
 
@@ -76,4 +80,21 @@ func (h *batchCreateTaskController) Handle(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"results": results})
+}
+
+// denyBindingBatch authorizes every item of a Publish-binding batch before
+// any enqueue. The first failing item refuses the whole batch with its index,
+// so a batch is all-or-nothing for authorization (platform ADR-0022 C1.2).
+func denyBindingBatch(c *gin.Context, tasks []createReq) bool {
+	scope, ok := middleware.GetBindingScope(c)
+	if !ok {
+		return false
+	}
+	for i, t := range tasks {
+		if code, reason := publishDenial(scope, t.Command, t.Webhook); code != "" {
+			middleware.DenyBinding(c, scope, http.StatusForbidden, code, reason, gin.H{"index": i})
+			return true
+		}
+	}
+	return false
 }

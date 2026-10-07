@@ -28,6 +28,9 @@ func (h *submitResultController) Handle(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing worker claims"})
 		return
 	}
+	if denyUnlessBindingOwner(c, id, resultsLookup(h.svc.Get)) {
+		return
+	}
 	req.WorkerID = claims.Subject
 	rec, err := h.svc.Submit(c.Request.Context(), id, req)
 	if err != nil {
