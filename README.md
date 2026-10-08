@@ -180,6 +180,20 @@ then fail closed with `503`. After every peer runs a compatible build, set the
 value to `v1` consistently across the cluster (or use
 `RAFT_TOPIC_CATALOG_PROTOCOL=v1`) to enable replicated topic administration.
 
+### List the tasks of a queue state
+
+An admin can page through the tasks of one queue state of its tenant —
+`ready` (claim order), `delayed`, `inProgress` or `dlq`:
+
+```bash
+curl 'http://localhost:8080/v1/codeq/admin/queues/GENERATE_MASTER/tasks?state=inProgress&limit=100' \
+  -H 'Authorization: Bearer <admin-token>'
+```
+
+The response is `{"tasks":[…],"nextCursor":"…"}`; pass `cursor=<nextCursor>`
+to get the next page until `nextCursor` is absent. `limit` defaults to 100
+(max 500). See [ADR 0005](docs/adr/0005-list-tasks-by-queue-state.md).
+
 For high-throughput producers and workers, use the gRPC streaming API — a
 long-lived bidirectional stream amortizes auth and pipelines acks. See the
 [Producer Stream](https://github.com/osvaldoandrade/codeq/wiki/IO-Producer-Stream)
