@@ -58,7 +58,7 @@ func (s *Server) Enqueue(ctx context.Context, req *clusterpb.EnqueueRequest) (*c
 	// Type-assert so we can use the cluster-aware EnqueueWithID — the
 	// router pre-picked the task ID at the hash boundary, we MUST honour it.
 	local, ok := s.Tasks.(interface {
-		EnqueueWithID(ctx context.Context, id string, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey string, visibleAt time.Time, tenantID string) (*domain.Task, bool, error)
+		EnqueueWithID(ctx context.Context, id string, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey, deduplicationKey string, visibleAt time.Time, tenantID string) (*domain.Task, bool, error)
 	})
 	if !ok {
 		return nil, errors.New("local TaskRepository does not support EnqueueWithID; cannot serve cluster Enqueue")
@@ -75,6 +75,7 @@ func (s *Server) Enqueue(ctx context.Context, req *clusterpb.EnqueueRequest) (*c
 		req.Webhook,
 		int(req.MaxAttempts),
 		req.IdempotencyKey,
+		req.DeduplicationKey,
 		visibleAt,
 		req.TenantId,
 	)
@@ -311,6 +312,7 @@ func domainTaskToProto(t *domain.Task) *clusterpb.Task {
 		UpdatedAt:         timestamppb.New(t.UpdatedAt),
 		TraceParent:       t.TraceParent,
 		TraceState:        t.TraceState,
+		DeduplicationKey:  t.DeduplicationKey,
 	}
 }
 
@@ -335,6 +337,7 @@ func protoToDomainTask(p *clusterpb.Task) *domain.Task {
 		ResultKey:         p.ResultKey,
 		TraceParent:       p.TraceParent,
 		TraceState:        p.TraceState,
+		DeduplicationKey:  p.DeduplicationKey,
 	}
 	if p.CreatedAt != nil {
 		t.CreatedAt = p.CreatedAt.AsTime()

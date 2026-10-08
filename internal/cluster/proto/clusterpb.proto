@@ -45,6 +45,7 @@ message Task {
   google.protobuf.Timestamp updated_at = 17;
   string trace_parent = 18;
   string trace_state = 19;
+  string deduplication_key = 20;
 }
 
 message ResultRecord {
@@ -201,6 +202,7 @@ message EnqueueRequest {
   // visible_at_unix=0 means "available immediately" (i.e. not delayed).
   int64 visible_at_unix = 8;
   string tenant_id = 9;
+  string deduplication_key = 10;
 }
 message EnqueueResponse {
   Task task = 1;
