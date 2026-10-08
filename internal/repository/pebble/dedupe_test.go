@@ -303,6 +303,54 @@ func TestDedupeClaimDeletesMapping(t *testing.T) {
 	}
 }
 
+// A retried task still carries its key but no longer holds it: re-claiming
+// it must leave the mapping of the newer task that took the key meanwhile,
+// or the next create would enqueue a second waiting task.
+func TestDedupeReclaimOfARetryKeepsTheNewerHolder(t *testing.T) {
+	for _, claimMany := range []bool{false, true} {
+		ctx := context.Background()
+		repo := NewTaskRepository(openTestDB(t), time.UTC, "fixed", 1, 5)
+		cmd := domain.CmdGenerateMaster
+		claim := func() *domain.Task {
+			t.Helper()
+			if claimMany {
+				got, err := repo.ClaimMany(ctx, "w1", []domain.Command{cmd}, 60, 1, 50, 3, dedupeTenant)
+				if err != nil || len(got) != 1 {
+					t.Fatalf("claim many: %v, %v", got, err)
+				}
+				return got[0]
+			}
+			got, ok, err := repo.Claim(ctx, "w1", []domain.Command{cmd}, 60, 50, 3, dedupeTenant)
+			if err != nil || !ok {
+				t.Fatalf("claim: %v, %v", ok, err)
+			}
+			return got
+		}
+		first, err := repo.Enqueue(ctx, cmd, `{"run":1}`, 5, "", 3, "", dedupeKey, time.Time{}, dedupeTenant)
+		if err != nil {
+			t.Fatalf("create first: %v", err)
+		}
+		if got := claim(); got.ID != first.ID {
+			t.Fatalf("claimed %s, want %s", got.ID, first.ID)
+		}
+		// A lower priority keeps the newer task waiting while the retry runs.
+		newer, err := repo.Enqueue(ctx, cmd, `{"run":2}`, 1, "", 3, "", dedupeKey, time.Time{}, dedupeTenant)
+		if err != nil || newer.ID == first.ID {
+			t.Fatalf("create after the claim = %v, %v; want a new task", newer, err)
+		}
+		if _, _, err := repo.Nack(ctx, first.ID, "w1", 0, 3, "retry"); err != nil {
+			t.Fatalf("nack: %v", err)
+		}
+		if got := claim(); got.ID != first.ID {
+			t.Fatalf("re-claimed %s, want the retried %s", got.ID, first.ID)
+		}
+		joined, err := repo.Enqueue(ctx, cmd, `{"run":3}`, 5, "", 3, "", dedupeKey, time.Time{}, dedupeTenant)
+		if err != nil || joined.ID != newer.ID {
+			t.Fatalf("create while the newer task waits (many=%v) = %v, %v; want it to join %s", claimMany, joined, err, newer.ID)
+		}
+	}
+}
+
 // snapshotStore returns every key and value under the codeq/ namespace.
 func snapshotStore(t *testing.T, db *DB) map[string]string {
 	t.Helper()

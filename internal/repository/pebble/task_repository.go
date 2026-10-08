@@ -728,7 +728,7 @@ func (r *TaskRepository) completeClaim(ctx context.Context, workerID string, cmd
 	if err := b.Set(KeyTask(id), updatedJSON, nil); err != nil {
 		return nil, false, err
 	}
-	if err := releaseDedupe(b, &t); err != nil {
+	if err := r.releaseDedupe(b, &t); err != nil {
 		return nil, false, err
 	}
 	// Phase 6 / M2: lease lives in memory; task body's LeaseUntil
@@ -871,7 +871,7 @@ collect:
 		if err := b.Set(KeyTask(h.id), updatedJSON, nil); err != nil {
 			return nil, err
 		}
-		if err := releaseDedupe(b, &t); err != nil {
+		if err := r.releaseDedupe(b, &t); err != nil {
 			return nil, err
 		}
 		// Phase 6 / M2: lease lives in-memory, recovered from task body

@@ -43,13 +43,29 @@ func (r *TaskRepository) waitingDuplicate(mappingKey []byte, cmd domain.Command,
 }
 
 // releaseDedupe deletes, inside the batch that moves t out of the waiting
-// state, the deduplication mapping t holds. The delete is unconditional: a
-// create that finds t waiting returns t instead of writing, so while t waits
-// the mapping cannot point at another task, and this batch is the one that
-// ends the wait.
-func releaseDedupe(b *pebbledb.Batch, t *domain.Task) error {
+// state, the deduplication mapping t holds. Only the create that wrote the
+// mapping makes t its holder: a task that waits again later (a nack or
+// lease-expiry retry) still carries its DeduplicationKey, but the mapping
+// may by then name a newer waiting task of the same key. So the delete
+// happens only while the mapping still names t. The check cannot race a
+// create: a create that finds the mapping naming t while t waits returns t
+// instead of writing, and t keeps waiting until this batch commits (the
+// claim holds t in flight), so the mapping cannot move between the read and
+// the commit.
+func (r *TaskRepository) releaseDedupe(b *pebbledb.Batch, t *domain.Task) error {
 	if t.DeduplicationKey == "" {
 		return nil
 	}
-	return b.Delete(KeyDedupe(t.Command, t.TenantID, t.DeduplicationKey), nil)
+	key := KeyDedupe(t.Command, t.TenantID, t.DeduplicationKey)
+	holder, err := r.db.Get(key)
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("dedupe release lookup: %w", err)
+	}
+	if string(holder) != t.ID {
+		return nil
+	}
+	return b.Delete(key, nil)
 }
