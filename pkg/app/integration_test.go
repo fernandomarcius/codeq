@@ -54,10 +54,10 @@ func TestHTTPIntegrationFlow(t *testing.T) {
 	}))
 	t.Cleanup(hookSrv.Close)
 
-	pcfg, _ := json.Marshal(map[string]any{"path": t.TempDir()})
+	pcfg, _ := json.Marshal(map[string]any{topicPersistencePathKey: t.TempDir()})
 	cfg := &config.Config{
 		Port:                               0,
-		PersistenceProvider:                "pebble",
+		PersistenceProvider:                topicTestStorageProvider,
 		PersistenceConfig:                  pcfg,
 		IdentityJwksURL:                    jwksSrv.URL,
 		IdentityIssuer:                     "codeq-test",
@@ -434,10 +434,10 @@ func TestHTTPIntegrationFlow_Sharded(t *testing.T) {
 	}))
 	t.Cleanup(jwksSrv.Close)
 
-	pcfg, _ := json.Marshal(map[string]any{"path": t.TempDir(), "numShards": 2})
+	pcfg, _ := json.Marshal(map[string]any{topicPersistencePathKey: t.TempDir(), fwdNumShards: 2})
 	cfg := &config.Config{
 		Port:                               0,
-		PersistenceProvider:                "pebble",
+		PersistenceProvider:                topicTestStorageProvider,
 		PersistenceConfig:                  pcfg,
 		IdentityJwksURL:                    jwksSrv.URL,
 		IdentityIssuer:                     "codeq-test",

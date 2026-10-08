@@ -152,7 +152,7 @@ logLevel: "info"
 	if cfg.Port != 9090 {
 		t.Errorf("Expected Port=9090 from env, got %d", cfg.Port)
 	}
-	if cfg.PersistenceProvider != "pebble" {
+	if cfg.PersistenceProvider != providerPebble {
 		t.Errorf("Expected PersistenceProvider=pebble, got %q", cfg.PersistenceProvider)
 	}
 	if cfg.IdentityServiceURL != "http://env-identity:9090" {
@@ -176,7 +176,7 @@ func TestLoadConfigOptional_EnvOverridesEmptyFile(t *testing.T) {
 	if cfg.Port != 7070 {
 		t.Errorf("Expected Port=7070 from env, got %d", cfg.Port)
 	}
-	if cfg.PersistenceProvider != "pebble" {
+	if cfg.PersistenceProvider != providerPebble {
 		t.Errorf("Expected PersistenceProvider=pebble, got %q", cfg.PersistenceProvider)
 	}
 	if cfg.IdentityServiceApiKey != "test-api-key" {
@@ -467,7 +467,7 @@ func TestLoadConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if cfg.Port != 9090 || cfg.PersistenceProvider != "pebble" {
+	if cfg.Port != 9090 || cfg.PersistenceProvider != providerPebble {
 		t.Fatalf("port=%d provider=%s", cfg.Port, cfg.PersistenceProvider)
 	}
 	if _, err := LoadConfig(filepath.Join(dir, "missing.yml")); err == nil {

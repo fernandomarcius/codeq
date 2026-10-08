@@ -18,24 +18,26 @@ import (
 )
 
 const (
-	benchTenant        = "bench-tenant"
-	benchProducerToken = "bench-producer-token"
-	benchWorkerToken   = "bench-worker-token"
-	benchProducerSub   = "bench-producer"
-	benchWorkerSub     = "bench-worker"
+	benchTenant             = "bench-tenant"
+	benchProducerToken      = "bench-producer-token"
+	benchWorkerToken        = "bench-worker-token"
+	benchProducerSub        = "bench-producer"
+	benchWorkerSub          = "bench-worker"
+	benchPersistenceKey     = "path"
+	benchPersistenceBackend = "pebble"
 )
 
 func newBenchApp(b *testing.B) *app.Application {
 	b.Helper()
 	gin.SetMode(gin.ReleaseMode)
 
-	pcfg, _ := json.Marshal(map[string]any{"path": b.TempDir()})
+	pcfg, _ := json.Marshal(map[string]any{benchPersistenceKey: b.TempDir()})
 	cfg := &config.Config{
 		Env:                 "dev",
 		Timezone:            "UTC",
 		LogLevel:            "error",
 		LogFormat:           "json",
-		PersistenceProvider: "pebble",
+		PersistenceProvider: benchPersistenceBackend,
 		PersistenceConfig:   pcfg,
 		DefaultLeaseSeconds: 60,
 		RequeueInspectLimit: 50,

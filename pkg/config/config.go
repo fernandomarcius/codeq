@@ -13,6 +13,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// providerPebble is the only persistence backend CodeQ opens.
+const providerPebble = "pebble"
+
 type Config struct {
 	TopicControllerAuthorityURL        string          `yaml:"topicControllerAuthorityUrl"`
 	Port                               int             `yaml:"port"`
@@ -510,7 +513,7 @@ func applyEnvAndDefaults(c *Config) {
 		c.BackoffPolicy = "exp_full_jitter"
 	}
 	if c.PersistenceProvider == "" {
-		c.PersistenceProvider = "pebble"
+		c.PersistenceProvider = providerPebble
 	}
 	if len(c.PersistenceConfig) == 0 {
 		c.PersistenceConfig = json.RawMessage(`{"path":"/var/lib/codeq/pebble"}`)
@@ -654,9 +657,9 @@ func (c *Config) Validate() error {
 
 	provider := c.PersistenceProvider
 	if provider == "" {
-		provider = "pebble"
+		provider = providerPebble
 	}
-	if provider != "pebble" {
+	if provider != providerPebble {
 		errs = append(errs, fmt.Sprintf("persistenceProvider %q is not supported; CodeQ persists on pebble", c.PersistenceProvider))
 	}
 

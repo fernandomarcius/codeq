@@ -69,9 +69,12 @@ func WithWorkerValidator(validator auth.Validator) ApplicationOption {
 	}
 }
 
+// pebblePersistenceProvider is the only backend NewApplication opens.
+const pebblePersistenceProvider = "pebble"
+
 // NewApplication builds a CodeQ process that persists on Pebble.
 func NewApplication(cfg *config.Config, opts ...ApplicationOption) (*Application, error) {
-	if cfg.PersistenceProvider != "" && cfg.PersistenceProvider != "pebble" {
+	if cfg.PersistenceProvider != "" && cfg.PersistenceProvider != pebblePersistenceProvider {
 		return nil, fmt.Errorf("persistence provider %q is not supported; CodeQ persists on pebble", cfg.PersistenceProvider)
 	}
 	return newPebbleApplication(cfg, opts...)
