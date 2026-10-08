@@ -61,6 +61,7 @@ type Task struct {
 	UpdatedAt         *timestamppb.Timestamp `protobuf:"bytes,17,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
 	TraceParent       string                 `protobuf:"bytes,18,opt,name=trace_parent,json=traceParent,proto3" json:"trace_parent,omitempty"`
 	TraceState        string                 `protobuf:"bytes,19,opt,name=trace_state,json=traceState,proto3" json:"trace_state,omitempty"`
+	DeduplicationKey  string                 `protobuf:"bytes,20,opt,name=deduplication_key,json=deduplicationKey,proto3" json:"deduplication_key,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -224,6 +225,13 @@ func (x *Task) GetTraceParent() string {
 func (x *Task) GetTraceState() string {
 	if x != nil {
 		return x.TraceState
+	}
+	return ""
+}
+
+func (x *Task) GetDeduplicationKey() string {
+	if x != nil {
+		return x.DeduplicationKey
 	}
 	return ""
 }
@@ -1660,10 +1668,11 @@ type EnqueueRequest struct {
 	MaxAttempts    int32                  `protobuf:"varint,6,opt,name=max_attempts,json=maxAttempts,proto3" json:"max_attempts,omitempty"`
 	IdempotencyKey string                 `protobuf:"bytes,7,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
 	// visible_at_unix=0 means "available immediately" (i.e. not delayed).
-	VisibleAtUnix int64  `protobuf:"varint,8,opt,name=visible_at_unix,json=visibleAtUnix,proto3" json:"visible_at_unix,omitempty"`
-	TenantId      string `protobuf:"bytes,9,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	VisibleAtUnix    int64  `protobuf:"varint,8,opt,name=visible_at_unix,json=visibleAtUnix,proto3" json:"visible_at_unix,omitempty"`
+	TenantId         string `protobuf:"bytes,9,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
+	DeduplicationKey string `protobuf:"bytes,10,opt,name=deduplication_key,json=deduplicationKey,proto3" json:"deduplication_key,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *EnqueueRequest) Reset() {
@@ -1759,6 +1768,13 @@ func (x *EnqueueRequest) GetTenantId() string {
 	return ""
 }
 
+func (x *EnqueueRequest) GetDeduplicationKey() string {
+	if x != nil {
+		return x.DeduplicationKey
+	}
+	return ""
+}
+
 type EnqueueResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Task          *Task                  `protobuf:"bytes,1,opt,name=task,proto3" json:"task,omitempty"`
@@ -1815,7 +1831,7 @@ var File_clusterpb_proto protoreflect.FileDescriptor
 
 const file_clusterpb_proto_rawDesc = "" +
 	"\n" +
-	"\x0fclusterpb.proto\x12\tclusterpb\x1a\x1fgoogle/protobuf/timestamp.proto\"\xfa\x04\n" +
+	"\x0fclusterpb.proto\x12\tclusterpb\x1a\x1fgoogle/protobuf/timestamp.proto\"\xa7\x05\n" +
 	"\x04Task\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x18\n" +
 	"\acommand\x18\x02 \x01(\tR\acommand\x12\x18\n" +
@@ -1841,7 +1857,8 @@ const file_clusterpb_proto_rawDesc = "" +
 	"updated_at\x18\x11 \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\x12!\n" +
 	"\ftrace_parent\x18\x12 \x01(\tR\vtraceParent\x12\x1f\n" +
 	"\vtrace_state\x18\x13 \x01(\tR\n" +
-	"traceState\"\xd3\x01\n" +
+	"traceState\x12+\n" +
+	"\x11deduplication_key\x18\x14 \x01(\tR\x10deduplicationKey\"\xd3\x01\n" +
 	"\fResultRecord\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x16\n" +
 	"\x06status\x18\x02 \x01(\tR\x06status\x12\x1f\n" +
@@ -1936,7 +1953,7 @@ const file_clusterpb_proto_rawDesc = "" +
 	"num_hashes\x18\x02 \x01(\rR\tnumHashes\x12\x1b\n" +
 	"\tnum_items\x18\x03 \x01(\x04R\bnumItems\x12\x1a\n" +
 	"\bsequence\x18\x04 \x01(\x04R\bsequence\x12\x17\n" +
-	"\anode_id\x18\x05 \x01(\tR\x06nodeId\"\x9b\x02\n" +
+	"\anode_id\x18\x05 \x01(\tR\x06nodeId\"\xc8\x02\n" +
 	"\x0eEnqueueRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x18\n" +
 	"\acommand\x18\x02 \x01(\tR\acommand\x12\x18\n" +
@@ -1946,7 +1963,9 @@ const file_clusterpb_proto_rawDesc = "" +
 	"\fmax_attempts\x18\x06 \x01(\x05R\vmaxAttempts\x12'\n" +
 	"\x0fidempotency_key\x18\a \x01(\tR\x0eidempotencyKey\x12&\n" +
 	"\x0fvisible_at_unix\x18\b \x01(\x03R\rvisibleAtUnix\x12\x1b\n" +
-	"\ttenant_id\x18\t \x01(\tR\btenantId\"L\n" +
+	"\ttenant_id\x18\t \x01(\tR\btenantId\x12+\n" +
+	"\x11deduplication_key\x18\n" +
+	" \x01(\tR\x10deduplicationKey\"L\n" +
 	"\x0fEnqueueResponse\x12#\n" +
 	"\x04task\x18\x01 \x01(\v2\x0f.clusterpb.TaskR\x04task\x12\x14\n" +
 	"\x05ready\x18\x02 \x01(\bR\x05ready2\xcd\a\n" +
