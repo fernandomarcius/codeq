@@ -313,8 +313,8 @@ func signAdminJWT(t *testing.T, key *rsa.PrivateKey, kid, iss, aud, sub string) 
 func createTask(t *testing.T, ctx context.Context, baseURL, token, webhook string) string {
 	t.Helper()
 	body := map[string]any{
-		"command":  string(domain.CmdGenerateMaster),
-		"payload":  map[string]any{"foo": "bar"},
+		keyCommand: string(domain.CmdGenerateMaster),
+		keyPayload: map[string]any{"foo": "bar"},
 		"priority": 5,
 		"webhook":  webhook,
 	}
