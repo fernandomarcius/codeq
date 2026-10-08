@@ -226,3 +226,70 @@ func TestShardedListWalksEveryShard(t *testing.T) {
 		t.Fatalf("garbage sharded cursor: err %v, want ErrInvalidCursor", err)
 	}
 }
+
+// storeContents returns every key and value under the codeq/ namespace.
+func storeContents(t *testing.T, db *DB) map[string]string {
+	t.Helper()
+	lower := []byte(namespace)
+	it, err := db.Iter(lower, prefixUpper(lower))
+	if err != nil {
+		t.Fatalf("iter: %v", err)
+	}
+	defer it.Close()
+	out := map[string]string{}
+	for valid := it.First(); valid; valid = it.Next() {
+		out[string(it.Key())] = string(it.Value())
+	}
+	return out
+}
+
+// Listing is a pure read: it leaves the store byte-for-byte unchanged, and
+// the same (state, limit, cursor) returns the same page every time.
+func TestListIsReadOnlyAndRepeatable(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	repo := NewTaskRepository(db, time.UTC, "fixed", 1, 5)
+	for i := range 5 {
+		mustEnqueue(t, repo, i, time.Time{}, listTenant)
+	}
+	mustEnqueue(t, repo, 5, time.Now().Add(time.Hour), listTenant)
+	before := storeContents(t, db)
+
+	first, err := repo.ListTasks(ctx, domain.CmdGenerateMaster, listTenant, domain.QueueStateReady, 2, "")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	for _, state := range []domain.QueueState{domain.QueueStateReady, domain.QueueStateDelayed, domain.QueueStateInProgress, domain.QueueStateDLQ} {
+		for range 3 {
+			if _, err := repo.ListTasks(ctx, domain.CmdGenerateMaster, listTenant, state, 2, ""); err != nil {
+				t.Fatalf("list %s: %v", state, err)
+			}
+		}
+	}
+	for i := range 3 {
+		again, err := repo.ListTasks(ctx, domain.CmdGenerateMaster, listTenant, domain.QueueStateReady, 2, "")
+		if err != nil || again.NextCursor != first.NextCursor || len(again.Tasks) != len(first.Tasks) {
+			t.Fatalf("repeat %d differs: %+v vs %+v (%v)", i, again, first, err)
+		}
+		for j := range first.Tasks {
+			if again.Tasks[j].ID != first.Tasks[j].ID {
+				t.Fatalf("repeat %d position %d: %s vs %s", i, j, again.Tasks[j].ID, first.Tasks[j].ID)
+			}
+		}
+		next1, err1 := repo.ListTasks(ctx, domain.CmdGenerateMaster, listTenant, domain.QueueStateReady, 2, first.NextCursor)
+		next2, err2 := repo.ListTasks(ctx, domain.CmdGenerateMaster, listTenant, domain.QueueStateReady, 2, first.NextCursor)
+		if err1 != nil || err2 != nil || next1.Tasks[0].ID != next2.Tasks[0].ID || next1.NextCursor != next2.NextCursor {
+			t.Fatalf("same cursor gave different pages: %+v / %+v (%v %v)", next1, next2, err1, err2)
+		}
+	}
+
+	after := storeContents(t, db)
+	if len(after) != len(before) {
+		t.Fatalf("listing changed the store: %d keys before, %d after", len(before), len(after))
+	}
+	for k, v := range before {
+		if after[k] != v {
+			t.Fatalf("listing rewrote key %q", k)
+		}
+	}
+}
