@@ -79,18 +79,23 @@ func NewSchedulerService(repo repository.TaskRepository, notifier NotifierServic
 
 // validateCreate rejects a create the scheduler must not enqueue: an empty
 // command, a webhook that is not an absolute http(s) URL, or both an
-// idempotency and a deduplication key.
-func validateCreate(cmd domain.Command, webhook, idempotencyKey, deduplicationKey string) error {
+// idempotency and a deduplication key. It marks the span the same way the
+// inline checks it replaces did.
+func validateCreate(span trace.Span, cmd domain.Command, webhook, idempotencyKey, deduplicationKey string) error {
 	if strings.TrimSpace(string(cmd)) == "" {
+		span.SetStatus(codes.Error, "invalid command")
 		return errors.New("invalid command")
 	}
 	if webhook != "" {
 		u, err := url.Parse(webhook)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "invalid webhook url")
 			return errors.New("invalid webhook url")
 		}
 	}
 	if idempotencyKey != "" && deduplicationKey != "" {
+		span.SetStatus(codes.Error, domain.ErrDeduplicationWithIdempotency.Error())
 		return domain.ErrDeduplicationWithIdempotency
 	}
 	return nil
@@ -123,9 +128,7 @@ func (s *schedulerService) CreateTask(ctx context.Context, cmd domain.Command, p
 	)
 	defer span.End()
 
-	if err := validateCreate(cmd, webhook, idempotencyKey, deduplicationKey); err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+	if err := validateCreate(span, cmd, webhook, idempotencyKey, deduplicationKey); err != nil {
 		return nil, err
 	}
 	if maxAttempts <= 0 {
