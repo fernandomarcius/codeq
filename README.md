@@ -149,6 +149,25 @@ curl -X POST http://localhost:8080/v1/codeq/tasks/<id>/result \
   -d '{"status":"COMPLETED","result":{"ok":true}}'
 ```
 
+### Deduplicate while a task waits
+
+Give creates that should collapse the same `deduplicationKey`. While a task of
+the same tenant, command and key is still waiting (ready or delayed), a create
+returns that task instead of enqueuing another; once a worker claims it, the
+next create enqueues a new task.
+
+```bash
+curl -X POST http://localhost:8080/v1/codeq/tasks \
+  -H 'Authorization: Bearer <producer-token>' \
+  -H 'Content-Type: application/json' \
+  -d '{"command":"SYNC_CHANNEL","payload":{"channelId":"c-7"},"deduplicationKey":"sync:c-7"}'
+```
+
+The first create wins: a joined create's payload, priority and schedule are
+discarded. `deduplicationKey` is also accepted per item in `POST /tasks/batch`
+and on the producer stream, and cannot be combined with `idempotencyKey`
+(`400`). See [ADR 0004](docs/adr/0004-deduplicate-waiting-tasks.md).
+
 ### Queue topic administration
 
 An authenticated admin can reconcile the provider policy for a tenant-scoped
