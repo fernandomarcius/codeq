@@ -240,19 +240,8 @@ func (r *TaskRepository) EnqueueWithID(ctx context.Context, id string, cmd domai
 		return nil, false, err
 	}
 	defer unlock()
-	if idempotencyKey != "" {
-		if replay, found, err := r.replayIdempotencyKey(ctx, idempotencyKey, tenantID); found || err != nil {
-			return replay, false, err
-		}
-	}
-	if err := r.ensureLeaderDispatch(ctx); err != nil {
-		return nil, false, err
-	}
-	if dedupeKey != nil {
-		existing, err := r.waitingDuplicate(dedupeKey, cmd, tenantID, deduplicationKey)
-		if err != nil || existing != nil {
-			return existing, false, err
-		}
+	if existing, found, err := r.precheckCreate(ctx, cmd, tenantID, idempotencyKey, deduplicationKey, dedupeKey); found || err != nil {
+		return existing, false, err
 	}
 
 	now := r.now()
@@ -302,6 +291,26 @@ func (r *TaskRepository) announceEnqueue(task *domain.Task, delayed bool, pendin
 	}
 	r.publishPending(task.Command, task.TenantID, task.Priority, pendingSeq, task.ID)
 	metrics.QueueDepth.WithLabelValues(string(task.Command), "ready").Inc()
+}
+
+// precheckCreate runs, under the create key's stripe, the checks a create
+// makes before writing: an idempotent replay, the leader gate, then a task
+// already waiting with the deduplication key. found reports that the create
+// must return existing instead of writing a task.
+func (r *TaskRepository) precheckCreate(ctx context.Context, cmd domain.Command, tenantID, idempotencyKey, deduplicationKey string, dedupeKey []byte) (*domain.Task, bool, error) {
+	if idempotencyKey != "" {
+		if replay, found, err := r.replayIdempotencyKey(ctx, idempotencyKey, tenantID); found || err != nil {
+			return replay, found, err
+		}
+	}
+	if err := r.ensureLeaderDispatch(ctx); err != nil {
+		return nil, false, err
+	}
+	if dedupeKey == nil {
+		return nil, false, nil
+	}
+	existing, err := r.waitingDuplicate(dedupeKey, cmd, tenantID, deduplicationKey)
+	return existing, existing != nil, err
 }
 
 // replayIdempotencyKey looks up the task an idempotency key maps to. If it
