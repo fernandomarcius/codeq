@@ -454,3 +454,30 @@ func TestValidate_RaftTopicCatalogProtocol(t *testing.T) {
 		t.Fatalf("unsupported protocol error = %v", err)
 	}
 }
+
+func TestLoadConfig(t *testing.T) {
+	t.Setenv("PORT", "")
+	t.Setenv("PERSISTENCE_PROVIDER", "")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "codeq.yml")
+	if err := os.WriteFile(path, []byte("port: 9090\npersistenceProvider: pebble\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Port != 9090 || cfg.PersistenceProvider != "pebble" {
+		t.Fatalf("port=%d provider=%s", cfg.Port, cfg.PersistenceProvider)
+	}
+	if _, err := LoadConfig(filepath.Join(dir, "missing.yml")); err == nil {
+		t.Fatal("expected missing file error")
+	}
+	bad := filepath.Join(dir, "bad.yml")
+	if err := os.WriteFile(bad, []byte(":\n  -"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(bad); err == nil {
+		t.Fatal("expected yaml error")
+	}
+}

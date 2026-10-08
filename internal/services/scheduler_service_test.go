@@ -210,6 +210,34 @@ func TestClaimTaskSuccess(t *testing.T) {
 	}
 }
 
+func TestClaimManyTasks(t *testing.T) {
+	ctx, svc := setupSchedulerTest(t)
+	for range 3 {
+		if _, err := svc.CreateTask(ctx, domain.CmdGenerateMaster, `{"k":"v"}`, 0, "", 3, "", time.Time{}, 0, ""); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+	}
+	if _, err := svc.ClaimManyTasks(ctx, "", nil, 60, 1, ""); err == nil {
+		t.Fatal("expected error for empty worker id")
+	}
+	none, err := svc.ClaimManyTasks(ctx, "worker-1", nil, 60, 0, "")
+	if err != nil || none != nil {
+		t.Fatalf("max<=0: tasks=%v err=%v", none, err)
+	}
+	tasks, err := svc.ClaimManyTasks(ctx, "worker-1", nil, 0, 2, "")
+	if err != nil {
+		t.Fatalf("claim many: %v", err)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("claimed %d, want 2", len(tasks))
+	}
+	for _, task := range tasks {
+		if task.WorkerID != "worker-1" {
+			t.Fatalf("worker %s", task.WorkerID)
+		}
+	}
+}
+
 func TestClaimTaskEmptyWorkerID(t *testing.T) {
 	ctx, svc := setupSchedulerTest(t)
 

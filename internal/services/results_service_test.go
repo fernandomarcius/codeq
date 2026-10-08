@@ -155,3 +155,63 @@ func TestResultsServiceBatchSubmit(t *testing.T) {
 		t.Errorf("Expected task1 status to be COMPLETED, got %s", task.Status)
 	}
 }
+
+func TestResultsServiceSubmit(t *testing.T) {
+	stores := openPebbleStores(t)
+	ctx := context.Background()
+	_, err := stores.tasks.Enqueue(ctx, domain.CmdGenerateMaster, `{"k":"v"}`, 0, "https://example.com/hook", 5, "", time.Time{}, "tenant-a")
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	claimed, ok, err := stores.tasks.Claim(ctx, "worker-1", []domain.Command{domain.CmdGenerateMaster}, 30, 1, 5, "tenant-a")
+	if err != nil || !ok || claimed == nil {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+
+	svc := NewResultsService(stores.results, &mockResultsUploader{}, nil, slog.Default(), time.Now, time.UTC)
+
+	if _, err := svc.Submit(ctx, "missing", domain.SubmitResultRequest{Status: domain.StatusCompleted, Result: map[string]any{"ok": true}}); err == nil || err.Error() != "task not found" {
+		t.Fatalf("missing task: %v", err)
+	}
+
+	pending, err := stores.tasks.Enqueue(ctx, domain.CmdGenerateMaster, `{}`, 0, "", 5, "", time.Time{}, "tenant-a")
+	if err != nil {
+		t.Fatalf("enqueue pending: %v", err)
+	}
+	if _, err := svc.Submit(ctx, pending.ID, domain.SubmitResultRequest{Status: domain.StatusCompleted, Result: map[string]any{"ok": true}}); err == nil || err.Error() != "not-in-progress" {
+		t.Fatalf("pending submit: %v", err)
+	}
+	if _, err := svc.Submit(ctx, claimed.ID, domain.SubmitResultRequest{WorkerID: "other", Status: domain.StatusCompleted, Result: map[string]any{"ok": true}}); err == nil || err.Error() != "not-owner" {
+		t.Fatalf("wrong worker: %v", err)
+	}
+	if _, err := svc.Submit(ctx, claimed.ID, domain.SubmitResultRequest{WorkerID: "worker-1", Status: domain.StatusCompleted}); err == nil || err.Error() != "result required when status=COMPLETED" {
+		t.Fatalf("missing result: %v", err)
+	}
+	if _, err := svc.Submit(ctx, claimed.ID, domain.SubmitResultRequest{WorkerID: "worker-1", Status: domain.StatusFailed}); err == nil || err.Error() != "error required when status=FAILED" {
+		t.Fatalf("missing error: %v", err)
+	}
+	if _, err := svc.Submit(ctx, claimed.ID, domain.SubmitResultRequest{WorkerID: "worker-1", Status: "NOPE"}); err == nil || err.Error() != "invalid status" {
+		t.Fatalf("invalid status: %v", err)
+	}
+
+	rec, err := svc.Submit(ctx, claimed.ID, domain.SubmitResultRequest{
+		WorkerID: "worker-1",
+		Status:   domain.StatusCompleted,
+		Result:   map[string]any{"ok": true},
+		Artifacts: []domain.ArtifactIn{
+			{Name: "link", URL: "https://example.com/link"},
+			{Name: "blob", ContentBase64: "aGVsbG8=", ContentType: "text/plain"},
+			{Name: "skip"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if rec.Status != domain.StatusCompleted || len(rec.Artifacts) != 2 {
+		t.Fatalf("record status=%s artifacts=%d", rec.Status, len(rec.Artifacts))
+	}
+	got, taskAfter, err := svc.Get(ctx, claimed.ID)
+	if err != nil || got == nil || taskAfter.Status != domain.StatusCompleted {
+		t.Fatalf("get after submit: rec=%v task=%v err=%v", got, taskAfter, err)
+	}
+}
