@@ -302,3 +302,49 @@ func TestDedupeClaimDeletesMapping(t *testing.T) {
 		}
 	}
 }
+
+// snapshotStore returns every key and value under the codeq/ namespace.
+func snapshotStore(t *testing.T, db *DB) map[string]string {
+	t.Helper()
+	lower := []byte(namespace)
+	it, err := db.Iter(lower, prefixUpper(lower))
+	if err != nil {
+		t.Fatalf("iter: %v", err)
+	}
+	defer it.Close()
+	out := map[string]string{}
+	for valid := it.First(); valid; valid = it.Next() {
+		out[string(it.Key())] = string(it.Value())
+	}
+	return out
+}
+
+// A create that joins a waiting task is a pure read: it writes nothing,
+// reports the task as not newly ready (so no worker is notified), and
+// returns the same task however many times it repeats.
+func TestDedupeJoinIsSideEffectFree(t *testing.T) {
+	db := openTestDB(t)
+	repo := NewTaskRepository(db, time.UTC, "fixed", 1, 5)
+	cmd := domain.CmdGenerateMaster
+	first, ready, err := repo.EnqueueWithReady(context.Background(), cmd, `{"n":1}`, 5, "", 3, "", dedupeKey, time.Time{}, dedupeTenant)
+	if err != nil || !ready {
+		t.Fatalf("first create: ready=%v err=%v", ready, err)
+	}
+	before := snapshotStore(t, db)
+
+	for i := range 3 {
+		again, ready, err := repo.EnqueueWithReady(context.Background(), cmd, `{"n":2}`, 9, "", 3, "", dedupeKey, time.Now().Add(time.Hour), dedupeTenant)
+		if err != nil || ready || again.ID != first.ID || again.Payload != first.Payload || again.Priority != first.Priority {
+			t.Fatalf("join %d = %+v ready=%v err=%v; want the unchanged first task, not ready", i, again, ready, err)
+		}
+	}
+	after := snapshotStore(t, db)
+	if len(after) != len(before) {
+		t.Fatalf("joins changed the store: %d keys before, %d after", len(before), len(after))
+	}
+	for k, v := range before {
+		if after[k] != v {
+			t.Fatalf("joins rewrote key %q", k)
+		}
+	}
+}
