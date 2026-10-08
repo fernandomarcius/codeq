@@ -75,6 +75,17 @@ type TaskRepository struct {
 	// don't dereference through r.db on every claim. Initialized in
 	// NewTaskRepository.
 	leases *leaseTable
+
+	// dispatchMu guards the hint channel, queued/inflight sets, and the
+	// leadership-rebuild flag. Lock order: dispatchMu, then leaseTable.mu.
+	// Never acquire dispatchMu while holding leaseTable.mu.
+	dispatchMu    sync.Mutex
+	dispatchCond  *sync.Cond
+	dispatchReady bool
+	rebuilding    bool
+	rebuiltEpoch  uint64
+	queued        map[string]struct{}
+	inflight      map[string]struct{}
 }
 
 // queueChan is the per-queue channel + recovery state. Each hint carries
@@ -154,7 +165,10 @@ func NewTaskRepository(db *DB, tz *time.Location, backoffPolicy string, backoffB
 		backoffMaxSeconds:  backoffMaxSeconds,
 		reconcile:          reconcileTracker{interval: defaultReconcileInterval},
 		leases:             db.Leases,
+		queued:             make(map[string]struct{}),
+		inflight:           make(map[string]struct{}),
 	}
+	r.dispatchCond = sync.NewCond(&r.dispatchMu)
 	// Re-seed in-memory queue channels from any pending keys that
 	// survived a previous shutdown. Has to happen before any handler
 	// starts serving claims; that's why we do it in the constructor.
@@ -169,6 +183,10 @@ func NewTaskRepository(db *DB, tz *time.Location, backoffPolicy string, backoffB
 	// case is reaper noticing lease expiry one tick later than ideal.
 	if err := r.recoverLeases(); err != nil {
 		panic(fmt.Sprintf("pebble lease recovery: %v", err))
+	}
+	if src, ok := r.db.repl.(leadershipSource); ok {
+		// goroutine: exits when LeaderObservation closes (raft.DB.Close).
+		go r.watchLeadership(src)
 	}
 	return r
 }
@@ -218,6 +236,9 @@ func (r *TaskRepository) EnqueueWithID(ctx context.Context, id string, cmd domai
 		} else if !errors.Is(err, ErrNotFound) {
 			return nil, false, fmt.Errorf("idempo lookup: %w", err)
 		}
+	}
+	if err := r.ensureLeaderDispatch(ctx); err != nil {
+		return nil, false, err
 	}
 
 	priority = normalizePriority(priority)
@@ -289,21 +310,26 @@ func (r *TaskRepository) EnqueueWithID(ctx context.Context, id string, cmd domai
 	if !delayed {
 		r.publishPending(cmd, tenantID, priority, pendingSeq, id)
 	} else {
-		r.delayedCounter(cmd, tenantID).Add(1)
+		r.NoteDelayed(cmd, tenantID)
 	}
 	metrics.TaskCreatedTotal.WithLabelValues(string(cmd)).Inc()
 	return task, ready, nil
 }
 
 // publishPending pushes a (seq, id) hint onto the per-queue channel
-// non-blocking. The fall-through (channel full) is intentional: the
-// data is already in Pebble; recovery on next restart picks it up.
+// non-blocking. A full channel drops the hint; the pending key is already
+// durable, and the next leadership rebuild (or process restart) scans it
+// back onto the channel. There is no claim-time scan.
+//
+// While a Raft rebuild has not finished, the hint is skipped on purpose:
+// the rebuild scans Pebble and would otherwise pair with this send.
 func (r *TaskRepository) publishPending(cmd domain.Command, tenantID string, prio int, seq uint64, id string) {
-	q := r.channelFor(cmd, tenantID, prio)
-	select {
-	case q.ch <- pendingHint{seq: seq, id: id}:
-	default:
+	r.dispatchMu.Lock()
+	defer r.dispatchMu.Unlock()
+	if r.db.repl != nil && !r.dispatchReady {
+		return
 	}
+	r.sendHintLocked(cmd, tenantID, prio, seq, id)
 }
 
 // ---------- Get ----------
@@ -326,6 +352,9 @@ func (r *TaskRepository) Get(ctx context.Context, taskID string) (*domain.Task, 
 // ---------- Claim ----------
 
 func (r *TaskRepository) Claim(ctx context.Context, workerID string, commands []domain.Command, leaseSeconds int, inspectLimit int, maxAttemptsDefault int, tenantID string) (*domain.Task, bool, error) {
+	if err := r.ensureLeaderDispatch(ctx); err != nil {
+		return nil, false, err
+	}
 	if inspectLimit <= 0 {
 		inspectLimit = defaultInspectLimit
 	}
@@ -485,10 +514,7 @@ func (r *TaskRepository) recoverQueues() error {
 		// happen given the cap) we'd drop the recovery hint. Drop is safe
 		// because the pending key stays in Pebble — a later scan/restart
 		// would pick it up. We log loudly if it happens.
-		q := r.channelFor(cmd, tenantID, prio)
-		select {
-		case q.ch <- pendingHint{seq: seq, id: id}:
-		default:
+		if !r.sendHintLocked(cmd, tenantID, prio, seq, id) {
 			return fmt.Errorf("channel full during recovery for queue %s/%s/%d (raise channelBufferSize)", cmd, tenantID, prio)
 		}
 	}
@@ -534,13 +560,13 @@ func (r *TaskRepository) recoverDelayedCounts() error {
 
 func (r *TaskRepository) tryPopPriority(ctx context.Context, workerID string, cmd domain.Command, priority, leaseSeconds int, tenantID string) (*domain.Task, bool, error) {
 	q := r.channelFor(cmd, tenantID, priority)
-	var h pendingHint
-	select {
-	case h = <-q.ch:
-	default:
+	h, ok := r.popHint(q)
+	if !ok {
 		return nil, false, nil
 	}
-	return r.completeClaim(ctx, workerID, cmd, tenantID, priority, leaseSeconds, h.seq, h.id)
+	task, claimed, err := r.completeClaim(ctx, workerID, cmd, tenantID, priority, leaseSeconds, h.seq, h.id)
+	r.finishHint(cmd, tenantID, priority, h, err != nil)
+	return task, claimed, err
 }
 
 // completeClaim performs the durable side of a claim. Because the channel
@@ -634,6 +660,9 @@ func (r *TaskRepository) ClaimMany(ctx context.Context, workerID string, command
 	if max <= 0 {
 		return nil, nil
 	}
+	if err := r.ensureLeaderDispatch(ctx); err != nil {
+		return nil, err
+	}
 	if inspectLimit <= 0 {
 		inspectLimit = defaultInspectLimit
 	}
@@ -658,6 +687,12 @@ func (r *TaskRepository) ClaimMany(ctx context.Context, workerID string, command
 		id       string
 	}
 	hints := make([]popped, 0, max)
+	committed := false
+	defer func() {
+		for _, h := range hints {
+			r.finishHint(h.cmd, tenantID, h.priority, pendingHint{seq: h.seq, id: h.id}, !committed)
+		}
+	}()
 	// Drain non-blocking, highest priority first, across all commands.
 	// Stop when we hit max or every queue is empty in this pass.
 collect:
@@ -665,15 +700,12 @@ collect:
 		for p := maxPriority; p >= minPriority && len(hints) < max; p-- {
 			q := r.channelFor(cmd, tenantID, p)
 			for len(hints) < max {
-				select {
-				case h := <-q.ch:
-					hints = append(hints, popped{cmd: cmd, priority: p, seq: h.seq, id: h.id})
-				default:
-					// channel empty at this priority — move on
-					goto nextprio
+				h, ok := r.popHint(q)
+				if !ok {
+					break
 				}
+				hints = append(hints, popped{cmd: cmd, priority: p, seq: h.seq, id: h.id})
 			}
-		nextprio:
 		}
 		if len(hints) >= max {
 			break collect
@@ -747,6 +779,7 @@ collect:
 	if err := r.db.CommitBatch(b); err != nil {
 		return nil, fmt.Errorf("commit claim-many: %w", err)
 	}
+	committed = true
 	// Lease table updates happen post-commit so a failed Pebble commit
 	// doesn't leave the in-memory state ahead of disk.
 	for _, t := range out {
@@ -833,6 +866,9 @@ func bytesHasSuffix(s, suffix []byte) bool {
 // ---------- Heartbeat ----------
 
 func (r *TaskRepository) Heartbeat(ctx context.Context, taskID string, workerID string, extendSeconds int) error {
+	if err := r.ensureLeaderDispatch(ctx); err != nil {
+		return err
+	}
 	taskJSON, err := r.db.Get(KeyTask(taskID))
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
@@ -879,6 +915,9 @@ func (r *TaskRepository) Heartbeat(ctx context.Context, taskID string, workerID 
 // ---------- Abandon ----------
 
 func (r *TaskRepository) Abandon(ctx context.Context, taskID string, workerID string) error {
+	if err := r.ensureLeaderDispatch(ctx); err != nil {
+		return err
+	}
 	taskJSON, err := r.db.Get(KeyTask(taskID))
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
@@ -930,6 +969,9 @@ func (r *TaskRepository) Abandon(ctx context.Context, taskID string, workerID st
 // ---------- Nack ----------
 
 func (r *TaskRepository) Nack(ctx context.Context, taskID string, workerID string, delaySeconds int, maxAttemptsDefault int, reason string) (int, bool, error) {
+	if err := r.ensureLeaderDispatch(ctx); err != nil {
+		return 0, false, err
+	}
 	taskJSON, err := r.db.Get(KeyTask(taskID))
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
@@ -1020,7 +1062,7 @@ func (r *TaskRepository) Nack(ctx context.Context, taskID string, workerID strin
 		return 0, false, err
 	}
 	r.leases.Delete(taskID)
-	r.delayedCounter(t.Command, t.TenantID).Add(1)
+	r.NoteDelayed(t.Command, t.TenantID)
 	return delaySeconds, false, nil
 }
 
@@ -1031,6 +1073,9 @@ func (r *TaskRepository) MoveDueDelayed(ctx context.Context, cmd domain.Command,
 }
 
 func (r *TaskRepository) moveDueDelayedForTenant(ctx context.Context, cmd domain.Command, limit int, tenantID string) (int, error) {
+	if err := r.ensureLeaderDispatch(ctx); err != nil {
+		return 0, err
+	}
 	if limit <= 0 {
 		limit = defaultInspectLimit
 	}
@@ -1081,6 +1126,7 @@ func (r *TaskRepository) moveDueDelayedForTenant(ctx context.Context, cmd domain
 		batchEntries = append(batchEntries, entry{delayedKey: k, id: id})
 	}
 	if len(batchEntries) == 0 {
+		r.zeroDelayedIfEmpty(cmd, tenantID)
 		return 0, nil
 	}
 
@@ -1136,7 +1182,7 @@ func (r *TaskRepository) moveDueDelayedForTenant(ctx context.Context, cmd domain
 	// some via successful move (counted in `moved`), some via ghost
 	// drop. Counter must track total deletions so it stays in sync
 	// with the on-disk reality.
-	counter.Add(-int64(len(batchEntries)))
+	r.addDelayed(cmd, tenantID, -int64(len(batchEntries)))
 	for _, p := range published {
 		r.publishPending(p.cmd, p.tenantID, p.prio, p.seq, p.id)
 	}
@@ -1177,15 +1223,22 @@ func (r *TaskRepository) requeueExpired(ctx context.Context, cmd domain.Command,
 	now := r.now()
 	moved := 0
 	for _, c := range candidates {
-		// Phase 6 / M2: lease lives in memory. If there's no entry the
-		// in-progress key is stale (recovery race or explicit delete) —
-		// clean it up.
+		// The lease table is process-local. After a leadership change it
+		// can be empty while the replicated task body still carries
+		// LeaseUntil. Adopt that timestamp. Deleting the in-progress
+		// index here used to strand the task with no pending hint.
 		e, ok := r.db.Leases.Get(c.id)
 		if !ok {
-			_ = r.db.Delete(c.inprog)
-			continue
-		}
-		if e.untilU > now.Unix() {
+			switch r.rememberDurableLease(c.id, now) {
+			case durableLeaseLive:
+				continue
+			case durableLeaseMissing:
+				_ = r.db.Delete(c.inprog)
+				continue
+			case durableLeaseExpired:
+				// Fall through and Nack from the task body.
+			}
+		} else if e.untilU > now.Unix() {
 			continue // still leased
 		}
 

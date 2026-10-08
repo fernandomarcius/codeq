@@ -36,6 +36,7 @@ type Reaper struct {
 	// (and fail with ErrNotLeader) or duplicate work the leader is
 	// already doing.
 	leaderGate func() bool
+	onDelayed  func(cmd domain.Command, tenantID string)
 
 	leaseInterval time.Duration // how often to scan lease/*
 	ttlInterval   time.Duration // how often to scan ttl_index
@@ -64,6 +65,11 @@ type ReaperOptions struct {
 	// pkg/app/application_pebble.go to raft.DB.IsLeader when raft is
 	// enabled; nil otherwise (single-node deployments run every tick).
 	LeaderGate func() bool
+	// OnDelayed fires after a lease-expired task is written to the
+	// delayed bucket. The repository uses it to bump the process-local
+	// delayed counter; without that bump Claim skips the delayed scan
+	// and the task never becomes pending again.
+	OnDelayed func(cmd domain.Command, tenantID string)
 }
 
 func NewReaper(db *DB, tz *time.Location, logger *slog.Logger, opts ReaperOptions) *Reaper {
@@ -104,6 +110,7 @@ func NewReaper(db *DB, tz *time.Location, logger *slog.Logger, opts ReaperOption
 		maxAttemptsDefault: opts.MaxAttemptsDefault,
 		dlqCallback:        opts.DLQCallback,
 		leaderGate:         opts.LeaderGate,
+		onDelayed:          opts.OnDelayed,
 		leaseInterval:      opts.LeaseInterval,
 		ttlInterval:        opts.TTLInterval,
 		leaseBatch:         opts.LeaseBatch,
@@ -272,6 +279,9 @@ func (r *Reaper) requeueExpiredOne(ctx context.Context, t *domain.Task, delaySec
 		return err
 	}
 	r.db.Leases.Delete(t.ID)
+	if r.onDelayed != nil {
+		r.onDelayed(t.Command, t.TenantID)
+	}
 	return nil
 }
 

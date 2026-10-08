@@ -107,6 +107,18 @@ func (t *leaseTable) SnapshotExpired(now int64, limit int) []string {
 	return out
 }
 
+// Clear drops every entry. Leadership rebuild calls it before
+// recoverLeases so a stale process-local table cannot hide replicated
+// in-progress tasks or, worse, disagree with them.
+func (t *leaseTable) Clear() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.m = make(map[string]leaseEntry, 1024)
+	t.mu.Unlock()
+}
+
 // Len returns the current entry count. Used by tests and metrics.
 func (t *leaseTable) Len() int {
 	t.mu.RLock()
@@ -170,4 +182,3 @@ func (r *TaskRepository) recoverLeases() error {
 	}
 	return it.Error()
 }
-

@@ -25,29 +25,29 @@ import (
 // bootstrap a fresh cluster; only the first node started in a new
 // deployment should do this.
 type Config struct {
-	Path            string
-	FsyncOnCommit   bool
-	SelfID          string
-	BindAddr        string
-	Bootstrap       bool
-	PeerAddrs       map[string]string // id → raft bind addr
+	Path          string
+	FsyncOnCommit bool
+	SelfID        string
+	BindAddr      string
+	Bootstrap     bool
+	PeerAddrs     map[string]string // id → raft bind addr
 	// PeerHTTPAddrs maps peer ID → HTTP base URL ("http://host:port").
 	// Optional. When set, LeaderHTTPAddr() returns the leader's HTTP
 	// URL so the status endpoint + smart clients can route writes
 	// directly to the leader.
 	PeerHTTPAddrs   map[string]string
-	HeartbeatMS     int               // raft heartbeat (default 1000)
-	ElectionMS      int               // raft election (default 1000)
-	LeaderLeaseMS   int               // raft leader lease (default 500)
-	CommitMS        int               // raft commit timeout (default 50)
-	SnapshotEntries uint64            // log entries before snapshot (default 8192)
-	ApplyTimeout    time.Duration     // per-write raft.Apply timeout (default 10s)
+	HeartbeatMS     int           // raft heartbeat (default 1000)
+	ElectionMS      int           // raft election (default 1000)
+	LeaderLeaseMS   int           // raft leader lease (default 500)
+	CommitMS        int           // raft commit timeout (default 50)
+	SnapshotEntries uint64        // log entries before snapshot (default 8192)
+	ApplyTimeout    time.Duration // per-write raft.Apply timeout (default 10s)
 	// StreamLayer is an optional override for the underlying transport
 	// layer. When non-nil (mux mode), Open uses
 	// hraft.NewNetworkTransport on top of it instead of opening its own
 	// TCP listener via NewTCPTransport. Used by the per-node
 	// MuxAcceptor so every shard shares one listener.
-	StreamLayer     hraft.StreamLayer
+	StreamLayer hraft.StreamLayer
 }
 
 func (c Config) heartbeat() time.Duration {
@@ -118,6 +118,11 @@ type DB struct {
 	cfg       Config
 
 	seq atomic.Uint64
+
+	// leadGen increments on every observed transition to leader, including
+	// transitions whose notification is later coalesced. Dispatch rebuild
+	// compares it so a missed channel read still forces a rescan.
+	leadGen atomic.Uint64
 
 	leaderCh chan bool
 	stopCh   chan struct{}
@@ -313,8 +318,12 @@ func (d *DB) shutdownRaftOnly() error {
 }
 
 // forwardLeaderChanges relays raft's LeaderCh to our buffered chan so
-// the reaper (and tests) can wait on a non-blocking signal.
+// the reaper (and tests) can wait on a non-blocking signal. The latest
+// value is what matters: a full buffer keeps that value and drops the
+// stale one. The goroutine closes leaderCh when it exits so consumers
+// unblock on DB.Close.
 func (d *DB) forwardLeaderChanges() {
+	defer close(d.leaderCh)
 	src := d.raft.LeaderCh()
 	for {
 		select {
@@ -324,14 +333,69 @@ func (d *DB) forwardLeaderChanges() {
 			if !ok {
 				return
 			}
-			select {
-			case d.leaderCh <- isLeader:
-			default:
-				// Buffer full; drop. The reaper only needs to know the
-				// current state, not the full history.
+			if isLeader {
+				d.leadGen.Add(1)
+			}
+			for {
+				select {
+				case next, still := <-src:
+					if !still {
+						d.deliverLeader(isLeader)
+						return
+					}
+					if next {
+						d.leadGen.Add(1)
+					}
+					isLeader = next
+				default:
+					d.deliverLeader(isLeader)
+					goto nextEvent
+				}
 			}
 		}
+	nextEvent:
+		continue
 	}
+}
+
+func (d *DB) deliverLeader(isLeader bool) {
+	select {
+	case d.leaderCh <- isLeader:
+		return
+	default:
+	}
+	select {
+	case <-d.leaderCh:
+	default:
+	}
+	select {
+	case d.leaderCh <- isLeader:
+	case <-d.stopCh:
+	}
+}
+
+// LeadershipEpoch reports how many times this process has observed a
+// transition to leader. It advances even when the notification channel
+// coalesces intermediate values.
+func (d *DB) LeadershipEpoch() uint64 { return d.leadGen.Load() }
+
+// Barrier blocks until every log entry committed before the call has
+// been applied to the local FSM. A new leader calls it before scanning
+// Pebble to rebuild the dispatch index.
+func (d *DB) Barrier(ctx context.Context) error {
+	if d == nil || d.raft == nil {
+		return fmt.Errorf("raft: db not open")
+	}
+	if !d.IsLeader() {
+		return ErrNotLeader
+	}
+	timeout := 2 * time.Second
+	if dl, ok := ctx.Deadline(); ok {
+		if remain := time.Until(dl); remain > 0 && remain < timeout {
+			timeout = remain
+		}
+	}
+	return d.raft.Barrier(timeout).Error()
 }
 
 // Close stops raft, closes the transport, and (if Open opened the
