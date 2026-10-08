@@ -14,12 +14,12 @@ import (
 func TestRaftClaimAfterLeaderLoss(t *testing.T) {
 	ports := pickThreeFreePorts(t)
 	peers := map[string]string{
-		"node-1": "127.0.0.1:" + ports[0],
-		"node-2": "127.0.0.1:" + ports[1],
-		"node-3": "127.0.0.1:" + ports[2],
+		topicNodeOne:   "127.0.0.1:" + ports[0],
+		topicNodeTwo:   "127.0.0.1:" + ports[1],
+		topicNodeThree: "127.0.0.1:" + ports[2],
 	}
 	nodes := make([]*raftTestNode, 3)
-	for i, id := range []string{"node-1", "node-2", "node-3"} {
+	for i, id := range []string{topicNodeOne, topicNodeTwo, topicNodeThree} {
 		nodes[i] = startRaftNode(t, id, peers, i == 0)
 	}
 	t.Cleanup(func() {
