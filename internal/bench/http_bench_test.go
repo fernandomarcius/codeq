@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 
 	"github.com/osvaldoandrade/codeq/pkg/app"
@@ -30,19 +29,14 @@ func newBenchApp(b *testing.B) *app.Application {
 	b.Helper()
 	gin.SetMode(gin.ReleaseMode)
 
-	mr, err := miniredis.Run()
-	if err != nil {
-		b.Fatalf("miniredis start: %v", err)
-	}
-	b.Cleanup(mr.Close)
-
+	pcfg, _ := json.Marshal(map[string]any{"path": b.TempDir()})
 	cfg := &config.Config{
 		Env:                 "dev",
 		Timezone:            "UTC",
 		LogLevel:            "error",
 		LogFormat:           "json",
-		RedisAddr:           mr.Addr(),
-		RedisPassword:       "",
+		PersistenceProvider: "pebble",
+		PersistenceConfig:   pcfg,
 		DefaultLeaseSeconds: 60,
 		RequeueInspectLimit: 50,
 		LocalArtifactsDir:   b.TempDir(),

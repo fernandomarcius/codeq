@@ -2,12 +2,19 @@ package ratelimit
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"strings"
 	"sync"
 	"time"
 )
+
+func sha256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
 
 // InMemoryLimiter is a process-local token-bucket rate limiter. Each
 // (scope, subject) pair gets its own bucket. There is no

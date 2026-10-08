@@ -81,12 +81,3 @@ func TestLocalUploaderRejectsSymlinkParent(t *testing.T) {
 	}
 }
 
-func TestNewRedisProvider(t *testing.T) {
-	client := NewRedisProvider("localhost:6379", "password")
-
-	if client == nil {
-		t.Fatal("Expected redis client to be non-nil")
-	}
-
-	defer client.Close()
-}

@@ -125,7 +125,7 @@ come from.
 | [`producer_stream_saturation_test.go`](../internal/bench/producer_stream_saturation_test.go) | `TestSaturation_ProducerStreamPath` | Producer concurrency sweep |
 | [`worker_stream_vs_rest_bench_test.go`](../internal/bench/worker_stream_vs_rest_bench_test.go) | `TestThroughput_StreamPath` / `_RESTPath` | Side-by-side worker stream vs REST |
 | [`cluster_throughput_test.go`](../internal/bench/cluster_throughput_test.go) | `TestClusterThroughput_StairStep` / `_VsSingleNode` | Multi-node consistent-hash cluster |
-| [`http_bench_test.go`](../internal/bench/http_bench_test.go) | `BenchmarkHTTP_CreateClaimComplete` | Legacy miniredis baseline (`go test -bench`) |
+| [`http_bench_test.go`](../internal/bench/http_bench_test.go) | `BenchmarkHTTP_CreateClaimComplete` | In-process HTTP cycle on Pebble (`go test -bench`) |
 
 ### Tuning env vars
 
@@ -175,7 +175,7 @@ PHASE8_SHARDS=4 PHASE6_PROD_BATCH=8 \
   go test -v -run='^TestProducerThroughput_StreamBatchPath$' -count=1 -timeout=120s ./internal/bench/...
 ```
 
-Legacy in-process HTTP cycle (miniredis-backed, fast regression check):
+In-process HTTP cycle on Pebble:
 
 ```bash
 go test ./internal/bench -bench BenchmarkHTTP_CreateClaimComplete -benchtime=30s

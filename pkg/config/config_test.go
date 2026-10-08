@@ -138,8 +138,6 @@ logLevel: "info"
 
 	// Set environment variables that should override file values
 	t.Setenv("PORT", "9090")
-	t.Setenv("REDIS_ADDR", "env-redis:6380")
-	t.Setenv("REDIS_PASSWORD", "env-password")
 	t.Setenv("IDENTITY_SERVICE_URL", "http://env-identity:9090")
 
 	cfg, err := LoadConfigOptional(configPath)
@@ -154,11 +152,8 @@ logLevel: "info"
 	if cfg.Port != 9090 {
 		t.Errorf("Expected Port=9090 from env, got %d", cfg.Port)
 	}
-	if cfg.RedisAddr != "env-redis:6380" {
-		t.Errorf("Expected RedisAddr='env-redis:6380' from env, got %q", cfg.RedisAddr)
-	}
-	if cfg.RedisPassword != "env-password" {
-		t.Errorf("Expected RedisPassword='env-password' from env, got %q", cfg.RedisPassword)
+	if cfg.PersistenceProvider != "pebble" {
+		t.Errorf("Expected PersistenceProvider=pebble, got %q", cfg.PersistenceProvider)
 	}
 	if cfg.IdentityServiceURL != "http://env-identity:9090" {
 		t.Errorf("Expected IdentityServiceURL='http://env-identity:9090' from env, got %q", cfg.IdentityServiceURL)
@@ -169,7 +164,6 @@ logLevel: "info"
 func TestLoadConfigOptional_EnvOverridesEmptyFile(t *testing.T) {
 	// Set multiple environment variables
 	t.Setenv("PORT", "7070")
-	t.Setenv("REDIS_ADDR", "redis.local:6379")
 	t.Setenv("IDENTITY_SERVICE_API_KEY", "test-api-key")
 	t.Setenv("PRODUCER_AUTH_PROVIDER", "static")
 
@@ -182,8 +176,8 @@ func TestLoadConfigOptional_EnvOverridesEmptyFile(t *testing.T) {
 	if cfg.Port != 7070 {
 		t.Errorf("Expected Port=7070 from env, got %d", cfg.Port)
 	}
-	if cfg.RedisAddr != "redis.local:6379" {
-		t.Errorf("Expected RedisAddr='redis.local:6379' from env, got %q", cfg.RedisAddr)
+	if cfg.PersistenceProvider != "pebble" {
+		t.Errorf("Expected PersistenceProvider=pebble, got %q", cfg.PersistenceProvider)
 	}
 	if cfg.IdentityServiceApiKey != "test-api-key" {
 		t.Errorf("Expected IdentityServiceApiKey='test-api-key' from env, got %q", cfg.IdentityServiceApiKey)

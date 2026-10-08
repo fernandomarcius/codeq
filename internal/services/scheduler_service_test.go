@@ -6,25 +6,12 @@ import (
 	"time"
 
 	"github.com/osvaldoandrade/codeq/internal/ratelimit"
-	"github.com/osvaldoandrade/codeq/internal/repository"
 	"github.com/osvaldoandrade/codeq/pkg/domain"
-
-	"github.com/alicebob/miniredis/v2"
-	"github.com/go-redis/redis/v8"
 )
 
-func setupSchedulerTest(t *testing.T) (context.Context, *miniredis.Miniredis, *redis.Client, repository.TaskRepository, SchedulerService) {
+func setupSchedulerTest(t *testing.T) (context.Context, SchedulerService) {
 	t.Helper()
-	mr, err := miniredis.Run()
-	if err != nil {
-		t.Fatalf("miniredis start: %v", err)
-	}
-	t.Cleanup(mr.Close)
-
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	t.Cleanup(func() { _ = rdb.Close() })
-
-	repo := repository.NewTaskRepository(rdb, time.UTC, "exp_full_jitter", 1, 10, nil)
+	repo := openPebbleStores(t).tasks
 
 	// Create a mock subscription repository for the notifier
 	mockSubRepo := &mockSubscriptionRepo{}
@@ -33,7 +20,7 @@ func setupSchedulerTest(t *testing.T) (context.Context, *miniredis.Miniredis, *r
 	now := func() time.Time { return time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC) }
 	svc := NewSchedulerService(repo, notifier, nil, time.UTC, now, 60, 50, 5, "exp_full_jitter", 5, 900)
 
-	return context.Background(), mr, rdb, repo, svc
+	return context.Background(), svc
 }
 
 // Mock subscription repository
@@ -80,7 +67,7 @@ func (m *mockSubscriptionRepo) CleanupExpired(ctx context.Context, limit int, be
 }
 
 func TestCreateTaskSuccess(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	task, err := svc.CreateTask(ctx, domain.CmdGenerateMaster, `{"key":"value"}`, 5, "https://example.com/webhook", 3, "", time.Time{}, 0, "")
 
@@ -99,7 +86,7 @@ func TestCreateTaskSuccess(t *testing.T) {
 }
 
 func TestCreateTaskEmptyCommand(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	_, err := svc.CreateTask(ctx, "", `{"key":"value"}`, 5, "", 3, "", time.Time{}, 0, "")
 
@@ -112,7 +99,7 @@ func TestCreateTaskEmptyCommand(t *testing.T) {
 }
 
 func TestCreateTaskInvalidWebhook(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	tests := []struct {
 		name    string
@@ -137,7 +124,7 @@ func TestCreateTaskInvalidWebhook(t *testing.T) {
 }
 
 func TestCreateTaskDefaultMaxAttempts(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	task, err := svc.CreateTask(ctx, domain.CmdGenerateMaster, `{"key":"value"}`, 5, "", 0, "", time.Time{}, 0, "")
 
@@ -150,7 +137,7 @@ func TestCreateTaskDefaultMaxAttempts(t *testing.T) {
 }
 
 func TestCreateTaskWithDelay(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	task, err := svc.CreateTask(ctx, domain.CmdGenerateMaster, `{"key":"value"}`, 5, "", 3, "", time.Time{}, 60, "")
 
@@ -164,7 +151,7 @@ func TestCreateTaskWithDelay(t *testing.T) {
 }
 
 func TestCreateTaskWithRunAt(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	runAt := time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC)
 	task, err := svc.CreateTask(ctx, domain.CmdGenerateMaster, `{"key":"value"}`, 5, "", 3, "", runAt, 0, "")
@@ -178,7 +165,7 @@ func TestCreateTaskWithRunAt(t *testing.T) {
 }
 
 func TestCreateTaskIdempotent(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	idempotencyKey := "test-key-123"
 
@@ -198,7 +185,7 @@ func TestCreateTaskIdempotent(t *testing.T) {
 }
 
 func TestClaimTaskSuccess(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	// Create a task first
 	_, err := svc.CreateTask(ctx, domain.CmdGenerateMaster, `{"key":"value"}`, 5, "", 3, "", time.Time{}, 0, "")
@@ -224,7 +211,7 @@ func TestClaimTaskSuccess(t *testing.T) {
 }
 
 func TestClaimTaskEmptyWorkerID(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	_, _, err := svc.ClaimTask(ctx, "", []domain.Command{domain.CmdGenerateMaster}, 60, 0, "")
 
@@ -237,7 +224,7 @@ func TestClaimTaskEmptyWorkerID(t *testing.T) {
 }
 
 func TestClaimTaskDefaultCommands(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	// Create tasks for both default commands
 	_, _ = svc.CreateTask(ctx, domain.CmdGenerateMaster, `{"key":"value"}`, 5, "", 3, "", time.Time{}, 0, "")
@@ -254,7 +241,7 @@ func TestClaimTaskDefaultCommands(t *testing.T) {
 }
 
 func TestClaimTaskWithWait(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	// Claim with wait but no tasks available - should timeout quickly
 	start := time.Now()
@@ -273,7 +260,7 @@ func TestClaimTaskWithWait(t *testing.T) {
 }
 
 func TestHeartbeatSuccess(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	// Create and claim a task
 	_, _ = svc.CreateTask(ctx, domain.CmdGenerateMaster, `{"key":"value"}`, 5, "", 3, "", time.Time{}, 0, "")
@@ -290,7 +277,7 @@ func TestHeartbeatSuccess(t *testing.T) {
 }
 
 func TestHeartbeatDefaultExtend(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	// Create and claim a task
 	_, _ = svc.CreateTask(ctx, domain.CmdGenerateMaster, `{"key":"value"}`, 5, "", 3, "", time.Time{}, 0, "")
@@ -307,7 +294,7 @@ func TestHeartbeatDefaultExtend(t *testing.T) {
 }
 
 func TestAbandonTask(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	// Create and claim a task
 	_, _ = svc.CreateTask(ctx, domain.CmdGenerateMaster, `{"key":"value"}`, 5, "", 3, "", time.Time{}, 0, "")
@@ -324,7 +311,7 @@ func TestAbandonTask(t *testing.T) {
 }
 
 func TestNackTaskSuccess(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	// Create and claim a task
 	_, _ = svc.CreateTask(ctx, domain.CmdGenerateMaster, `{"key":"value"}`, 5, "", 3, "", time.Time{}, 0, "")
@@ -348,7 +335,7 @@ func TestNackTaskSuccess(t *testing.T) {
 }
 
 func TestNackTaskEmptyWorkerID(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	_, _, err := svc.NackTask(ctx, "task-123", "", 0, "error")
 
@@ -361,7 +348,7 @@ func TestNackTaskEmptyWorkerID(t *testing.T) {
 }
 
 func TestNackTaskNotFound(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	_, _, err := svc.NackTask(ctx, "nonexistent-task", "worker-1", 0, "error")
 
@@ -371,7 +358,7 @@ func TestNackTaskNotFound(t *testing.T) {
 }
 
 func TestNackTaskWithExplicitDelay(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	// Create and claim a task
 	_, _ = svc.CreateTask(ctx, domain.CmdGenerateMaster, `{"key":"value"}`, 5, "", 3, "", time.Time{}, 0, "")
@@ -392,7 +379,7 @@ func TestNackTaskWithExplicitDelay(t *testing.T) {
 }
 
 func TestNackTaskDelayExceedsMax(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	// Create and claim a task
 	_, _ = svc.CreateTask(ctx, domain.CmdGenerateMaster, `{"key":"value"}`, 5, "", 3, "", time.Time{}, 0, "")
@@ -413,7 +400,7 @@ func TestNackTaskDelayExceedsMax(t *testing.T) {
 }
 
 func TestGetTask(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	// Create a task
 	created, _ := svc.CreateTask(ctx, domain.CmdGenerateMaster, `{"key":"value"}`, 5, "", 3, "", time.Time{}, 0, "")
@@ -430,7 +417,7 @@ func TestGetTask(t *testing.T) {
 }
 
 func TestAdminQueues(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	queues, err := svc.AdminQueues(ctx)
 
@@ -443,7 +430,7 @@ func TestAdminQueues(t *testing.T) {
 }
 
 func TestQueueStats(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	// Create a task
 	_, _ = svc.CreateTask(ctx, domain.CmdGenerateMaster, `{"key":"value"}`, 5, "", 3, "", time.Time{}, 0, "")
@@ -460,7 +447,7 @@ func TestQueueStats(t *testing.T) {
 }
 
 func TestCleanupExpired(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	// Create some tasks
 	_, _ = svc.CreateTask(ctx, domain.CmdGenerateMaster, `{"key":"value"}`, 5, "", 3, "", time.Time{}, 0, "")
@@ -477,7 +464,7 @@ func TestCleanupExpired(t *testing.T) {
 }
 
 func TestCleanupExpiredDefaultLimit(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	// Cleanup with zero limit (should use default 1000)
 	deleted, err := svc.CleanupExpired(ctx, 0, time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC))
@@ -491,7 +478,7 @@ func TestCleanupExpiredDefaultLimit(t *testing.T) {
 }
 
 func TestCleanupExpiredZeroBefore(t *testing.T) {
-	ctx, _, _, _, svc := setupSchedulerTest(t)
+	ctx, svc := setupSchedulerTest(t)
 
 	// Cleanup with zero time (should use current time from now())
 	deleted, err := svc.CleanupExpired(ctx, 10, time.Time{})
@@ -505,13 +492,7 @@ func TestCleanupExpiredZeroBefore(t *testing.T) {
 }
 
 func TestNewSchedulerServiceDefaults(t *testing.T) {
-	mr, _ := miniredis.Run()
-	defer mr.Close()
-
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	defer rdb.Close()
-
-	repo := repository.NewTaskRepository(rdb, time.UTC, "exp_full_jitter", 1, 10, nil)
+	repo := openPebbleStores(t).tasks
 	mockSubRepo := &mockSubscriptionRepo{}
 	notifier := NewNotifierService(mockSubRepo, nil, "test-secret", 5, nil, ratelimit.Bucket{}, nil)
 

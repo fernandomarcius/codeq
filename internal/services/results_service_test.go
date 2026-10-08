@@ -6,11 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/osvaldoandrade/codeq/internal/repository"
 	"github.com/osvaldoandrade/codeq/pkg/domain"
-
-	"github.com/alicebob/miniredis/v2"
-	"github.com/go-redis/redis/v8"
 )
 
 // mockUploader for testing
@@ -34,13 +30,7 @@ func (e *mockResultsError) Error() string {
 }
 
 func TestNewResultsService(t *testing.T) {
-	mr, _ := miniredis.Run()
-	defer mr.Close()
-
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	defer rdb.Close()
-
-	repo := repository.NewResultRepository(rdb, time.UTC, nil)
+	repo := openPebbleStores(t).results
 	uploader := &mockResultsUploader{}
 	logger := slog.Default()
 	now := func() time.Time { return time.Now() }
@@ -52,13 +42,7 @@ func TestNewResultsService(t *testing.T) {
 }
 
 func TestResultsServiceGetTaskNotFound(t *testing.T) {
-	mr, _ := miniredis.Run()
-	defer mr.Close()
-
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	defer rdb.Close()
-
-	repo := repository.NewResultRepository(rdb, time.UTC, nil)
+	repo := openPebbleStores(t).results
 	uploader := &mockResultsUploader{}
 	logger := slog.Default()
 	now := func() time.Time { return time.Now() }
@@ -75,17 +59,11 @@ func TestResultsServiceGetTaskNotFound(t *testing.T) {
 }
 
 func TestResultsServiceGetResultNotFound(t *testing.T) {
-	mr, _ := miniredis.Run()
-	defer mr.Close()
-
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	defer rdb.Close()
-
-	// Create a task but no result
-	taskRepo := repository.NewTaskRepository(rdb, time.UTC, "exp_full_jitter", 1, 10, nil)
+	stores := openPebbleStores(t)
+	taskRepo := stores.tasks
 	task, _ := taskRepo.Enqueue(context.Background(), domain.CmdGenerateMaster, `{"test":"data"}`, 0, "", 5, "", time.Time{}, "")
 
-	repo := repository.NewResultRepository(rdb, time.UTC, nil)
+	repo := stores.results
 	uploader := &mockResultsUploader{}
 	logger := slog.Default()
 	now := func() time.Time { return time.Now() }
@@ -102,14 +80,8 @@ func TestResultsServiceGetResultNotFound(t *testing.T) {
 }
 
 func TestResultsServiceBatchSubmit(t *testing.T) {
-	mr, _ := miniredis.Run()
-	defer mr.Close()
-
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	defer rdb.Close()
-
-	// Setup task repository and create test tasks
-	taskRepo := repository.NewTaskRepository(rdb, time.UTC, "exp_full_jitter", 1, 10, nil)
+	stores := openPebbleStores(t)
+	taskRepo := stores.tasks
 
 	// Create 3 tasks
 	task1, _ := taskRepo.Enqueue(context.Background(), domain.CmdGenerateMaster, `{"test":"data1"}`, 0, "", 5, "", time.Time{}, "")
@@ -122,7 +94,7 @@ func TestResultsServiceBatchSubmit(t *testing.T) {
 	_, _, _ = taskRepo.Claim(context.Background(), "worker1", cmds, 30, 1, 5, "")
 	_, _, _ = taskRepo.Claim(context.Background(), "worker1", cmds, 30, 1, 5, "")
 
-	resultRepo := repository.NewResultRepository(rdb, time.UTC, nil)
+	resultRepo := stores.results
 	uploader := &mockResultsUploader{}
 	logger := slog.Default()
 	now := func() time.Time { return time.Now() }

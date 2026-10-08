@@ -168,7 +168,7 @@ curl -X PUT http://localhost:8080/v1/codeq/admin/topics/payments-events \
 removal requires `DELETE ...?deletionPolicy=Delete`; omitting the explicit
 policy returns `400`.
 
-The catalog is durable in Redis and standalone Pebble. In Raft mode, topic
+The catalog is durable in Pebble. In Raft mode, topic
 writes flow through the shard-0 replicated FSM, followers forward writes
 in-process to a leader configured in `RAFT_PEER_HTTP_ADDRS` (never `307`; `503`
 `leader_unavailable` when no configured leader is known; `504`/`502` without

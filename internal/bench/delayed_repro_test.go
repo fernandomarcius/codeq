@@ -109,7 +109,7 @@ func TestReproDelayedResultFailures(t *testing.T) {
 
 	deadline := time.Now().Add(runDuration)
 
-	httpClient := &http.Client{Timeout: 10 * time.Second}
+	httpClient := benchHTTPClient()
 
 	var (
 		created   atomic.Int64

@@ -10,8 +10,8 @@ services:
       ENV: ${CODEQ_ENV:-prod}
       LOG_LEVEL: ${CODEQ_LOG_LEVEL:-info}
       LOG_FORMAT: json
-      REDIS_ADDR: ${REDIS_ADDR:-kvrocks:6666}
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      PERSISTENCE_PROVIDER: pebble
+      PERSISTENCE_CONFIG: '{"path":"/var/lib/codeq/pebble"}'
       IDENTITY_SERVICE_URL: ${IDENTITY_SERVICE_URL:?set IDENTITY_SERVICE_URL}
       WORKER_JWKS_URL: ${WORKER_JWKS_URL:?set WORKER_JWKS_URL}
       WORKER_ISSUER: ${WORKER_ISSUER:?set WORKER_ISSUER}
@@ -29,27 +29,16 @@ services:
       TRACING_OTLP_ENDPOINT: ${TRACING_OTLP_ENDPOINT:-}
       TRACING_OTLP_INSECURE: ${TRACING_OTLP_INSECURE:-false}
       TRACING_SAMPLE_RATIO: ${TRACING_SAMPLE_RATIO:-1.0}
-    depends_on:
-      - kvrocks
     volumes:
       - codeq-artifacts:/var/lib/codeq/artifacts
-    restart: unless-stopped
-    networks:
-      - codeq
-
-  kvrocks:
-    image: apache/kvrocks:2.7.0
-    ports:
-      - "${KVROCKS_PORT:-6666}:6666"
-    volumes:
-      - kvrocks-data:/var/lib/kvrocks
+      - codeq-pebble:/var/lib/codeq/pebble
     restart: unless-stopped
     networks:
       - codeq
 
 volumes:
   codeq-artifacts:
-  kvrocks-data:
+  codeq-pebble:
 
 networks:
   codeq:

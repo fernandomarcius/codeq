@@ -199,7 +199,7 @@ func TestRaftConfig_MutualExclusion(t *testing.T) {
 
 	c3 := base()
 	c3.PersistenceProvider = "redis"
-	if err := c3.Validate(); err == nil || !strings.Contains(err.Error(), "persistenceProvider=pebble") {
+	if err := c3.Validate(); err == nil || !strings.Contains(err.Error(), "persists on pebble") {
 		t.Errorf("raft+redis: want persistence error, got %v", err)
 	}
 

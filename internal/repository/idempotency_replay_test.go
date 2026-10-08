@@ -3,7 +3,6 @@ package repository
 import (
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/osvaldoandrade/codeq/pkg/domain"
 )
@@ -11,7 +10,6 @@ import (
 const (
 	replayTenantA = "tenant-a"
 	replayTenantB = "tenant-b"
-	replayKey     = "order-42"
 )
 
 func TestReplayIdempotentOnlySameTenant(t *testing.T) {
@@ -38,25 +36,5 @@ func TestReplayIdempotentOnlySameTenant(t *testing.T) {
 	legacy := &domain.Task{ID: "t-3"}
 	if got, err := ReplayIdempotent(legacy, ""); err != nil || got != legacy {
 		t.Fatalf("legacy empty tenant replay: got %v, %v", got, err)
-	}
-}
-
-func TestRedisIdempotencyIsTenantBound(t *testing.T) {
-	ctx, _, _, repo := setupRepo(t)
-	cmd := domain.CmdGenerateMaster
-	first, err := repo.Enqueue(ctx, cmd, `{"secret":1}`, 0, "", 5, replayKey, time.Time{}, replayTenantA)
-	if err != nil {
-		t.Fatalf("enqueue: %v", err)
-	}
-	// Twice: the second call takes the Bloom "maybe present" path.
-	for i := range 2 {
-		got, err := repo.Enqueue(ctx, cmd, `{}`, 0, "", 5, replayKey, time.Time{}, replayTenantB)
-		if !errors.Is(err, domain.ErrIdempotencyConflict) || got != nil {
-			t.Fatalf("cross-tenant #%d: got %v, %v; want nil, ErrIdempotencyConflict", i, got, err)
-		}
-	}
-	again, err := repo.Enqueue(ctx, cmd, `{}`, 0, "", 5, replayKey, time.Time{}, replayTenantA)
-	if err != nil || again.ID != first.ID {
-		t.Fatalf("same-tenant replay: got %v, %v; want %s", again, err, first.ID)
 	}
 }

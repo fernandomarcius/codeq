@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/go-redis/redis/v8"
 
 	"net"
 
@@ -66,17 +65,6 @@ func validateClusterConfig(c config.ClusterConfig) error {
 	return nil
 }
 
-// noopLimiter is the rate-limiter the Pebble path uses: there is no
-// shared bucket across processes (Pebble is single-instance), and the
-// in-flight benchmark doesn't exercise webhook rate limiting. A real
-// deployment can replace this with an in-process token bucket without
-// touching the redis path.
-type noopLimiter struct{}
-
-func (noopLimiter) Allow(_ context.Context, _ string, _ string, _ ratelimit.Bucket) (ratelimit.Decision, error) {
-	return ratelimit.Decision{Allowed: true}, nil
-}
-
 // pebbleConfig is the shape we expect when PersistenceProvider="pebble".
 // "path" is the only required field; "fsyncOnCommit" can be flipped on for
 // the durability-first tier (defaults to no-sync for max throughput).
@@ -91,43 +79,15 @@ type pebbleConfig struct {
 	NumShards int `json:"numShards"`
 }
 
-// newPebbleApplication constructs the full Application stack against an
-// embedded Pebble DB. It mirrors the redis NewApplication shape so the
-// caller (NewApplication itself) can swap on cfg.PersistenceProvider with
-// no other downstream changes.
-//
-// redisClient is still required for ratelimit + (currently) the
-// notifier/subscription helpers that haven't been ported. They'll either
-// be migrated in a follow-up or wired against an in-process token-bucket;
-// for now we accept the dual dependency so Pebble can be enabled without
-// rewriting half the system at once.
-func newPebbleApplication(
-	cfg *config.Config,
-	redisClient *redis.Client,
-	limiter ratelimit.Limiter,
-	loc *time.Location,
-	logger *slog.Logger,
-	webhookClient *http.Client,
-	tracingShutdown func(context.Context) error,
-	shardSupplier domain.ShardSupplier,
-	opts ...ApplicationOption,
-) (*Application, error) {
-	// Initialize anything the dispatch site couldn't pre-build for us; the
-	// Pebble path is reachable both from NewApplication (where everything
-	// would already be set) and directly in tests (everything nil).
-	if loc == nil {
-		l, err := time.LoadLocation(cfg.Timezone)
-		if err != nil || l == nil {
-			l = time.UTC
-		}
-		loc = l
+// newPebbleApplication constructs the Application stack on embedded Pebble.
+// Rate limiting is process-local (one bucket map per process).
+func newPebbleApplication(cfg *config.Config, opts ...ApplicationOption) (*Application, error) {
+	loc, err := time.LoadLocation(cfg.Timezone)
+	if err != nil || loc == nil {
+		loc = time.UTC
 	}
-	if logger == nil {
-		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	}
-	if webhookClient == nil {
-		webhookClient = &http.Client{Transport: http.DefaultTransport, Timeout: 15 * time.Second}
-	}
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	webhookClient := &http.Client{Timeout: 15 * time.Second}
 
 	var pc pebbleConfig
 	if len(cfg.PersistenceConfig) > 0 {
@@ -402,6 +362,7 @@ func newPebbleApplication(
 	}
 
 	subs := services.NewSubscriptionService(subRepo)
+	limiter := ratelimit.NewInMemoryLimiter()
 	notifier := services.NewNotifierService(subRepo, logger, cfg.WebhookHmacSecret, cfg.SubscriptionMinIntervalSeconds, limiter, ratelimit.Bucket(cfg.RateLimit.Webhook), webhookClient)
 	cleanup := services.NewSubscriptionCleanupService(subRepo, logger, cfg.SubscriptionCleanupIntervalSeconds)
 	resultCallback := services.NewResultCallbackService(
@@ -415,8 +376,8 @@ func newPebbleApplication(
 		webhookClient,
 	)
 
-	// Background reaper: enforces lease expiry + TTL cleanup, which Redis
-	// gives us via key TTL. Phase 8: one reaper per Pebble shard so the
+	// Background reaper: Pebble has no key TTL, so this sweep enforces lease
+	// expiry and delayed-task visibility. Phase 8: one reaper per Pebble shard so the
 	// sweeps run in parallel and the per-shard commit pipelines stay
 	// independent. In raft mode, LeaderGate keeps followers out of the
 	// sweep — only the leader writes through raft.Apply.
@@ -460,7 +421,7 @@ func newPebbleApplication(
 		cfg.BackoffMaxSeconds,
 	)
 
-	// Result service & uploader mirror the redis path verbatim.
+	// Result service writes completed payloads through the local uploader.
 	uploader := providers.NewLocalUploader(cfg.LocalArtifactsDir)
 	results := services.NewResultsService(resultRepo, uploader, resultCallback, logger, time.Now, loc)
 
@@ -471,7 +432,7 @@ func newPebbleApplication(
 	}
 	engine.Use(middleware.LoggerMiddleware(logger))
 
-	// Subscription cleanup goroutine — same cadence as the redis path.
+	// Subscription cleanup goroutine.
 	go cleanup.Start(bgCtx)
 
 	topicService := topicsapp.NewService(topicpebble.NewTopicStore(db), time.Now)
@@ -515,6 +476,7 @@ func newPebbleApplication(
 	}
 
 	cleanupStartupFailure := func() {
+		_ = limiter.Close()
 		bgCancel()
 		if grpcSrv != nil {
 			grpcSrv.Stop()
@@ -594,6 +556,7 @@ func newPebbleApplication(
 	}
 
 	app.TracingShutdown = func(ctx context.Context) error {
+		_ = limiter.Close()
 		bgCancel()
 		stopGRPCServer(ctx, &grpcServerHandle{srv: grpcSrv, lis: grpcLis})
 		stopGRPCServer(ctx, workerStream)
@@ -619,10 +582,7 @@ func newPebbleApplication(
 				logger.Warn("pebble close", "err", err)
 			}
 		}
-		if tracingShutdown == nil {
-			return nil
-		}
-		return tracingShutdown(ctx)
+		return nil
 	}
 
 	return app, nil

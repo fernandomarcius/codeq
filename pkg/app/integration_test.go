@@ -20,18 +20,10 @@ import (
 	_ "github.com/osvaldoandrade/codeq/pkg/auth/jwks" // Register JWKS provider
 	"github.com/osvaldoandrade/codeq/pkg/config"
 	"github.com/osvaldoandrade/codeq/pkg/domain"
-
-	"github.com/alicebob/miniredis/v2"
-	"github.com/go-redis/redis/v8"
 )
 
 func TestHTTPIntegrationFlow(t *testing.T) {
 	ctx := context.Background()
-	mr, err := miniredis.Run()
-	if err != nil {
-		t.Fatalf("miniredis start: %v", err)
-	}
-	t.Cleanup(mr.Close)
 
 	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -62,9 +54,11 @@ func TestHTTPIntegrationFlow(t *testing.T) {
 	}))
 	t.Cleanup(hookSrv.Close)
 
+	pcfg, _ := json.Marshal(map[string]any{"path": t.TempDir()})
 	cfg := &config.Config{
 		Port:                               0,
-		RedisAddr:                          mr.Addr(),
+		PersistenceProvider:                "pebble",
+		PersistenceConfig:                  pcfg,
 		IdentityJwksURL:                    jwksSrv.URL,
 		IdentityIssuer:                     "codeq-test",
 		IdentityAudience:                   "codeq-producer",
@@ -419,24 +413,10 @@ func doJSON(t *testing.T, ctx context.Context, method, url, token string, body a
 	return resp.StatusCode, string(b)
 }
 
-// TestHTTPIntegrationFlow_Sharded verifies that the full task lifecycle works
-// correctly when queue sharding is enabled with multiple Redis backends.
-// It tests both shard routing and cross-shard admin aggregation.
+// TestHTTPIntegrationFlow_Sharded verifies the task lifecycle with two
+// Pebble shards (persistenceConfig.numShards).
 func TestHTTPIntegrationFlow_Sharded(t *testing.T) {
 	ctx := context.Background()
-
-	// Create two separate miniredis instances simulating two shard backends
-	mrPrimary, err := miniredis.Run()
-	if err != nil {
-		t.Fatalf("miniredis primary: %v", err)
-	}
-	t.Cleanup(mrPrimary.Close)
-
-	mrCompute, err := miniredis.Run()
-	if err != nil {
-		t.Fatalf("miniredis compute: %v", err)
-	}
-	t.Cleanup(mrCompute.Close)
 
 	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -454,9 +434,11 @@ func TestHTTPIntegrationFlow_Sharded(t *testing.T) {
 	}))
 	t.Cleanup(jwksSrv.Close)
 
+	pcfg, _ := json.Marshal(map[string]any{"path": t.TempDir(), "numShards": 2})
 	cfg := &config.Config{
 		Port:                               0,
-		RedisAddr:                          mrPrimary.Addr(),
+		PersistenceProvider:                "pebble",
+		PersistenceConfig:                  pcfg,
 		IdentityJwksURL:                    jwksSrv.URL,
 		IdentityIssuer:                     "codeq-test",
 		IdentityAudience:                   "codeq-producer",
@@ -481,18 +463,6 @@ func TestHTTPIntegrationFlow_Sharded(t *testing.T) {
 		ResultWebhookMaxAttempts:           3,
 		ResultWebhookBaseBackoffSeconds:    1,
 		ResultWebhookMaxBackoffSeconds:     2,
-		Sharding: config.ShardingConfig{
-			Enabled:      true,
-			DefaultShard: "primary",
-			CommandMappings: map[string]string{
-				"GENERATE_MASTER": "compute",
-			},
-			TenantOverrides: map[string]string{},
-			Backends: map[string]config.ShardBackendConfig{
-				"primary": {Address: mrPrimary.Addr(), PoolSize: 5},
-				"compute": {Address: mrCompute.Addr(), PoolSize: 5},
-			},
-		},
 	}
 
 	cfg.ProducerAuthProvider = "jwks"
@@ -527,23 +497,9 @@ func TestHTTPIntegrationFlow_Sharded(t *testing.T) {
 	workerToken := signWorkerJWT(t, privKey, kid, "codeq-test", "codeq-worker", "worker-1")
 	producerToken := signProducerJWT(t, privKey, kid, "codeq-test", "codeq-producer", "user-1")
 
-	// Create task (GENERATE_MASTER → compute shard)
 	taskID := createTask(t, ctx, server.URL, producerToken, "")
 
-	// Verify task data is on compute shard, NOT primary
-	computeClient := redis.NewClient(&redis.Options{Addr: mrCompute.Addr()})
-	primaryClient := redis.NewClient(&redis.Options{Addr: mrPrimary.Addr()})
-
-	taskJSON, err := computeClient.HGet(ctx, "codeq:tasks", taskID).Result()
-	if err != nil || taskJSON == "" {
-		t.Fatalf("expected task on compute shard, got err=%v", err)
-	}
-	_, err = primaryClient.HGet(ctx, "codeq:tasks", taskID).Result()
-	if err == nil {
-		t.Fatal("task should NOT be on primary shard")
-	}
-
-	// Task operations through sharded repository: claim → heartbeat → nack → claim → result.
+	// Task operations across Pebble shards: claim → heartbeat → nack → claim → result.
 	// The trailing submitResult exercises the sharded result path; without
 	// shardedResultRepository this would 4xx because resultRepo would HGet
 	// codeq:tasks on the primary backend (where sharded tasks don't live).

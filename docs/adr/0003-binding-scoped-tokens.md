@@ -80,7 +80,7 @@ command. A task created by one tenant was returned, with payload and
 `idempotencyKey`. Now:
 
 - **Replay is tenant-bound for every token kind.** When a key already maps
-  to a task, every backend (Pebble, sharded Pebble, Redis, and the cluster
+  to a task, the Pebble repository and the cluster
   router, which maps the owner's answer back) returns it only when
   `task.tenantId` equals the caller's resolved tenant, by exact match
   (including the empty legacy tenant). Otherwise `POST /v1/codeq/tasks`

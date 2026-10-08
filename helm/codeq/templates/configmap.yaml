@@ -7,7 +7,9 @@ metadata:
 data:
   scheduler-api.yaml: |
     port: {{ .Values.config.port }}
-    redisAddr: {{- if .Values.kvrocks.enabled }} {{ printf "%s-kvrocks:%d" (include "codeq.fullname" .) .Values.kvrocks.service.port | quote }}{{- else }} {{ .Values.config.redisAddr | quote }}{{- end }}
+    persistenceProvider: pebble
+    persistenceConfig:
+      path: {{ .Values.persistence.pebble.path | quote }}
 
     identityServiceUrl: {{ .Values.config.identityServiceUrl | quote }}
     identityServiceApiKey: {{- if .Values.secrets.enabled }} ""{{- else }} {{ .Values.secrets.identityServiceApiKey | quote }}{{- end }}

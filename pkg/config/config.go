@@ -209,14 +209,6 @@ func applyEnvAndDefaults(c *Config) {
 			c.Port = p
 		}
 	}
-	if v := os.Getenv("REDIS_ADDR"); v != "" {
-		c.RedisAddr = v
-	}
-	if v := os.Getenv("REDIS_PASSWORD"); v != "" {
-		c.RedisPassword = v
-	} else if v := os.Getenv("KVROCKS_PASSWORD"); v != "" {
-		c.RedisPassword = v
-	}
 	if v := os.Getenv("PERSISTENCE_PROVIDER"); v != "" {
 		c.PersistenceProvider = v
 	}
@@ -462,9 +454,6 @@ func applyEnvAndDefaults(c *Config) {
 	if c.Port == 0 {
 		c.Port = 8080
 	}
-	if c.RedisAddr == "" {
-		c.RedisAddr = "localhost:6379"
-	}
 	if c.TracingServiceName == "" {
 		c.TracingServiceName = "codeq"
 	}
@@ -520,19 +509,11 @@ func applyEnvAndDefaults(c *Config) {
 	if c.BackoffPolicy == "" {
 		c.BackoffPolicy = "exp_full_jitter"
 	}
-	// Default persistence provider to "redis" for backward compatibility
 	if c.PersistenceProvider == "" {
-		c.PersistenceProvider = "redis"
+		c.PersistenceProvider = "pebble"
 	}
-	// If no persistence config provided, create default Redis config from legacy settings
-	if c.PersistenceConfig == nil || len(c.PersistenceConfig) == 0 {
-		redisConfig := map[string]string{
-			"addr":     c.RedisAddr,
-			"password": c.RedisPassword,
-		}
-		if configJSON, err := json.Marshal(redisConfig); err == nil {
-			c.PersistenceConfig = configJSON
-		}
+	if len(c.PersistenceConfig) == 0 {
+		c.PersistenceConfig = json.RawMessage(`{"path":"/var/lib/codeq/pebble"}`)
 	}
 	if c.WorkerAudience == "" {
 		c.WorkerAudience = "codeq-worker"
@@ -582,8 +563,8 @@ func applyEnvAndDefaults(c *Config) {
 		c.RateLimit.Admin.BurstSize = 0
 	}
 
-	log.Printf("Scheduler Config: {Port:%d Redis:%s Identity:%s TZ:%s Lease:%ds Inspect:%d}\n",
-		c.Port, c.RedisAddr, c.IdentityServiceURL, c.Timezone, c.DefaultLeaseSeconds, c.RequeueInspectLimit)
+	log.Printf("Scheduler Config: {Port:%d Persistence:%s Identity:%s TZ:%s Lease:%ds Inspect:%d}\n",
+		c.Port, c.PersistenceProvider, c.IdentityServiceURL, c.Timezone, c.DefaultLeaseSeconds, c.RequeueInspectLimit)
 
 	// Backward compatibility: auto-configure auth providers if not explicitly set
 	if c.ProducerAuthProvider == "" && c.IdentityJwksURL != "" {
@@ -671,6 +652,14 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	provider := c.PersistenceProvider
+	if provider == "" {
+		provider = "pebble"
+	}
+	if provider != "pebble" {
+		errs = append(errs, fmt.Sprintf("persistenceProvider %q is not supported; CodeQ persists on pebble", c.PersistenceProvider))
+	}
+
 	if c.Raft.Enabled {
 		if c.Cluster.Enabled {
 			errs = append(errs, "raft.enabled and cluster.enabled are mutually exclusive")
@@ -688,9 +677,6 @@ func (c *Config) Validate() error {
 			if _, ok := c.Raft.Peers[c.Raft.SelfID]; !ok {
 				errs = append(errs, fmt.Sprintf("raft.selfId %q not present in raft.peers", c.Raft.SelfID))
 			}
-		}
-		if c.PersistenceProvider != "" && c.PersistenceProvider != "pebble" {
-			errs = append(errs, fmt.Sprintf("raft.enabled requires persistenceProvider=pebble, got %q", c.PersistenceProvider))
 		}
 		if protocol := strings.TrimSpace(c.Raft.TopicCatalogProtocol); protocol != "" && protocol != "v1" {
 			errs = append(errs, fmt.Sprintf("raft.topicCatalogProtocol %q is unsupported (expected v1 or empty)", protocol))

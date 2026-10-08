@@ -7,26 +7,10 @@ timezone: America/Sao_Paulo
 logLevel: info
 logFormat: json
 
-# === Persistence Plugin Configuration ===
-# Choose your persistence backend. Available options:
-# - redis: Redis/KVRocks (default, production-ready)
-# - memory: In-memory storage (testing only, data is lost on restart)
-
-# Option 1: Redis Plugin (Default)
-persistenceProvider: redis
+# CodeQ persists on Pebble. persistenceProvider must be pebble.
+persistenceProvider: pebble
 persistenceConfig:
-  addr: localhost:6379
-  password: "" # optional, leave empty if no password
-
-# Option 2: Memory Plugin (Testing Only)
-# persistenceProvider: memory
-# persistenceConfig: {}
-
-# === Legacy Redis Settings (deprecated) ===
-# These are still supported for backward compatibility
-# If persistenceProvider is not set, these will be used automatically
-redisAddr: localhost:6379
-redisPassword: ""
+  path: /var/lib/codeq/pebble
 
 # === Authentication ===
 # Producer authentication (for task submission)

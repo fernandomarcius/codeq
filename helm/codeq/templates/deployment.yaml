@@ -65,6 +65,8 @@ spec:
               subPath: scheduler-api.yaml
             - name: artifacts
               mountPath: {{ .Values.config.localArtifactsDir }}
+            - name: pebble
+              mountPath: {{ .Values.persistence.pebble.path }}
             {{- with .Values.extraVolumeMounts }}
 {{ toYaml . | indent 12 }}
             {{- end }}
@@ -90,6 +92,13 @@ spec:
           {{- if .Values.persistence.artifacts.enabled }}
           persistentVolumeClaim:
             claimName: {{ include "codeq.fullname" . }}-artifacts
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: pebble
+          {{- if .Values.persistence.pebble.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "codeq.fullname" . }}-pebble
           {{- else }}
           emptyDir: {}
           {{- end }}
