@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -25,13 +26,15 @@ import (
 // Routing decisions, in one place so they're easy to audit:
 //   - Enqueue / EnqueueWithReady → router picks the ID, hash → owner.
 //     Owner == self ⇒ local EnqueueWithID; else gRPC.Enqueue.
-//   - Get / Heartbeat / Abandon / Nack → ID hash routes directly.
+//   - Get / Heartbeat / Progress / Abandon / Nack → ID hash routes directly.
 //   - Claim → scatter-gather LocalClaim across every node; first
 //     non-empty response wins. Workers can pass a shard-affinity header
 //     (handled at the controller layer) to force a single-node claim.
 //   - MoveDueDelayed / CleanupExpired → local only (each node owns its
 //     own delayed/dlq buckets for the ids it hashes to).
 //   - PendingLength / QueueStats / AdminQueues → scatter-gather + sum.
+//   - RequeueDLQTask / DeleteTask → ID hash routes directly; RequeueDLQ
+//     walks every node in ring order (dlq_operations.go, ADR 0009).
 //
 // Errors: remote calls translate the structured response flags
 // (NotFound / NotOwner / NotInProgress) back into the same "not-found"
@@ -86,14 +89,17 @@ func (r *TaskRouter) peerHasLikely(ownerID, key string) bool {
 // ---------------- Enqueue ----------------
 
 // Enqueue creates a task on the node that owns its ID. See EnqueueWithReady.
-func (r *TaskRouter) Enqueue(ctx context.Context, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey, deduplicationKey string, visibleAt time.Time, tenantID string) (*domain.Task, error) {
-	t, _, err := r.EnqueueWithReady(ctx, cmd, payload, priority, webhook, maxAttempts, idempotencyKey, deduplicationKey, visibleAt, tenantID)
+func (r *TaskRouter) Enqueue(ctx context.Context, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey, deduplicationKey, taskID string, visibleAt time.Time, tenantID string) (*domain.Task, error) {
+	t, _, err := r.EnqueueWithReady(ctx, cmd, payload, priority, webhook, maxAttempts, idempotencyKey, deduplicationKey, taskID, visibleAt, tenantID)
 	return t, err
 }
 
 // EnqueueWithReady is Enqueue that also reports whether the new task is
 // immediately ready to claim.
-func (r *TaskRouter) EnqueueWithReady(ctx context.Context, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey, deduplicationKey string, visibleAt time.Time, tenantID string) (*domain.Task, bool, error) {
+func (r *TaskRouter) EnqueueWithReady(ctx context.Context, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey, deduplicationKey, taskID string, visibleAt time.Time, tenantID string) (*domain.Task, bool, error) {
+	if taskID != "" {
+		return r.enqueueNamed(ctx, taskID, cmd, payload, priority, webhook, maxAttempts, visibleAt, tenantID)
+	}
 	// Pre-pick the ID so the hash → owner decision is deterministic.
 	// Bias toward local ownership: the producer-side router would
 	// otherwise pay a cross-node gRPC for (N-1)/N of all creates, which
@@ -138,6 +144,49 @@ func (r *TaskRouter) EnqueueWithReady(ctx context.Context, cmd domain.Command, p
 		// restore the sentinel so the HTTP layer answers 409 with no task.
 		if errMessageHas(err, domain.ErrIdempotencyConflict.Error()) {
 			return nil, false, domain.ErrIdempotencyConflict
+		}
+		if errMessageHas(err, domain.ErrTaskIDConflict.Error()) {
+			return nil, false, domain.ErrTaskIDConflict
+		}
+		return nil, false, err
+	}
+	return protoToDomainTask(resp.Task), resp.Ready, nil
+}
+
+// enqueueNamed stores a task under an ID the client chose, on the node that
+// owns that ID. The owner runs the existence check, so a replay and a
+// cross-tenant conflict are decided once.
+func (r *TaskRouter) enqueueNamed(ctx context.Context, taskID string, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, visibleAt time.Time, tenantID string) (*domain.Task, bool, error) {
+	if r.ring.IsLocal(taskID) {
+		t, ready, err := r.local.EnqueueNamed(ctx, taskID, cmd, payload, priority, webhook, maxAttempts, visibleAt, tenantID)
+		if err == nil && t != nil && r.localBloom != nil {
+			r.localBloom.Add(t.ID)
+		}
+		return t, ready, err
+	}
+	owner := r.ring.Owner(taskID)
+	c, err := r.pool.Client(owner)
+	if err != nil {
+		return nil, false, fmt.Errorf("dial owner %s: %w", owner.ID, err)
+	}
+	var visible int64
+	if !visibleAt.IsZero() {
+		visible = visibleAt.Unix()
+	}
+	resp, err := c.Enqueue(ctx, &clusterpb.EnqueueRequest{
+		Id:            taskID,
+		Command:       string(cmd),
+		Payload:       []byte(payload),
+		Priority:      safeint.Int32(priority),
+		Webhook:       webhook,
+		MaxAttempts:   safeint.Int32(maxAttempts),
+		VisibleAtUnix: visible,
+		TenantId:      tenantID,
+		Named:         true,
+	})
+	if err != nil {
+		if errMessageHas(err, domain.ErrTaskIDConflict.Error()) {
+			return nil, false, domain.ErrTaskIDConflict
 		}
 		return nil, false, err
 	}
@@ -206,6 +255,35 @@ func (r *TaskRouter) Heartbeat(ctx context.Context, taskID string, workerID stri
 		return errors.New("not-found")
 	case resp.NotOwner:
 		return errors.New("not-owner")
+	}
+	return nil
+}
+
+// Progress stores the lease holder's progress value on the node that
+// owns taskID, locally or through the owner's Progress RPC.
+func (r *TaskRouter) Progress(ctx context.Context, taskID string, workerID string, progress json.RawMessage) error {
+	if r.ring.IsLocal(taskID) {
+		return r.local.Progress(ctx, taskID, workerID, progress)
+	}
+	owner := r.ring.Owner(taskID)
+	if !r.peerHasLikely(owner.ID, taskID) {
+		return errors.New("not-found")
+	}
+	c, err := r.pool.Client(owner)
+	if err != nil {
+		return err
+	}
+	resp, err := c.Progress(ctx, &clusterpb.ProgressRequest{TaskId: taskID, WorkerId: workerID, Progress: progress})
+	if err != nil {
+		return err
+	}
+	switch {
+	case resp.NotFound:
+		return errors.New("not-found")
+	case resp.NotOwner:
+		return errors.New("not-owner")
+	case resp.NotInProgress:
+		return errors.New("not-in-progress")
 	}
 	return nil
 }

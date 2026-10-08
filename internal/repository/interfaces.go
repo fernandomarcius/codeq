@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/osvaldoandrade/codeq/pkg/domain"
@@ -10,12 +11,16 @@ import (
 // TaskRepository is the queue storage contract. The server implements it
 // with Pebble. Callers depend on this interface, not on a backend.
 type TaskRepository interface {
-	Enqueue(ctx context.Context, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey, deduplicationKey string, visibleAt time.Time, tenantID string) (*domain.Task, error)
+	Enqueue(ctx context.Context, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey, deduplicationKey, taskID string, visibleAt time.Time, tenantID string) (*domain.Task, error)
 	// EnqueueWithReady behaves like Enqueue but also reports whether this insert just
 	// transitioned the immediate pending queue from empty to non-empty.
-	EnqueueWithReady(ctx context.Context, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey, deduplicationKey string, visibleAt time.Time, tenantID string) (*domain.Task, bool, error)
+	EnqueueWithReady(ctx context.Context, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey, deduplicationKey, taskID string, visibleAt time.Time, tenantID string) (*domain.Task, bool, error)
 	Claim(ctx context.Context, workerID string, commands []domain.Command, leaseSeconds int, inspectLimit int, maxAttemptsDefault int, tenantID string) (*domain.Task, bool, error)
 	Heartbeat(ctx context.Context, taskID string, workerID string, extendSeconds int) error
+	// Progress stores the progress value reported by the worker holding the
+	// lease of an in-progress task. It fails with "not-found", "not-owner"
+	// or "not-in-progress" like the other lease-holder operations.
+	Progress(ctx context.Context, taskID string, workerID string, progress json.RawMessage) error
 	Abandon(ctx context.Context, taskID string, workerID string) error
 	Nack(ctx context.Context, taskID string, workerID string, delaySeconds int, maxAttemptsDefault int, reason string) (int, bool, error)
 	MoveDueDelayed(ctx context.Context, cmd domain.Command, limit int) (int, error)
@@ -27,6 +32,17 @@ type TaskRepository interface {
 	// resuming after cursor (empty for the first page). See ADR 0005.
 	ListTasks(ctx context.Context, cmd domain.Command, tenantID string, state domain.QueueState, limit int, cursor string) (*domain.TaskPage, error)
 	CleanupExpired(ctx context.Context, limit int, before time.Time) (int, error)
+	// RequeueDLQTask moves one dead-lettered task back to the ready queue
+	// of its priority with no attempts and no error. It fails with
+	// "not-found" or domain.ErrTaskNotInDLQ. See ADR 0009.
+	RequeueDLQTask(ctx context.Context, taskID string) (*domain.Task, error)
+	// RequeueDLQ requeues up to limit tasks of the (cmd, tenant) dead-letter
+	// queue and reports whether entries remain. limit 0 only reports.
+	RequeueDLQ(ctx context.Context, cmd domain.Command, tenantID string, limit int) (*domain.DLQRequeue, error)
+	// DeleteTask removes a task that is not in progress, its result and the
+	// queue index entry that points at it. It fails with "not-found" or
+	// domain.ErrTaskInProgress. See ADR 0009 for what it leaves behind.
+	DeleteTask(ctx context.Context, taskID string) error
 }
 
 // ResultRepository stores task results and the completion transition.

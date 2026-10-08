@@ -58,3 +58,7 @@ Proposed → Accepted → (Superseded by NNNN | Deprecated)
 | [0003](0003-binding-scoped-tokens.md) | Enforce binding-scoped tokens for workload-cluster QueueTopic bindings | Proposed |
 | [0004](0004-deduplicate-waiting-tasks.md) | Deduplicate creates while a task waits | Proposed |
 | [0005](0005-list-tasks-by-queue-state.md) | List the tasks of a queue state | Proposed |
+| [0006](0006-recurring-schedules.md) | Recurring schedules | Proposed |
+| [0007](0007-task-progress.md) | Task progress reported by the lease holder | Proposed |
+| [0008](0008-client-chosen-task-ids.md) | Client-chosen task IDs | Proposed |
+| [0009](0009-dlq-operations.md) | Requeue and delete dead-lettered tasks | Proposed |

@@ -59,6 +59,7 @@ func (s *Server) Enqueue(ctx context.Context, req *clusterpb.EnqueueRequest) (*c
 	// router pre-picked the task ID at the hash boundary, we MUST honour it.
 	local, ok := s.Tasks.(interface {
 		EnqueueWithID(ctx context.Context, id string, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey, deduplicationKey string, visibleAt time.Time, tenantID string) (*domain.Task, bool, error)
+		EnqueueNamed(ctx context.Context, id string, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, visibleAt time.Time, tenantID string) (*domain.Task, bool, error)
 	})
 	if !ok {
 		return nil, errors.New("local TaskRepository does not support EnqueueWithID; cannot serve cluster Enqueue")
@@ -67,18 +68,34 @@ func (s *Server) Enqueue(ctx context.Context, req *clusterpb.EnqueueRequest) (*c
 	if req.VisibleAtUnix > 0 {
 		visibleAt = time.Unix(req.VisibleAtUnix, 0)
 	}
-	task, ready, err := local.EnqueueWithID(ctx,
-		req.Id,
-		domain.Command(req.Command),
-		string(req.Payload),
-		int(req.Priority),
-		req.Webhook,
-		int(req.MaxAttempts),
-		req.IdempotencyKey,
-		req.DeduplicationKey,
-		visibleAt,
-		req.TenantId,
-	)
+	var task *domain.Task
+	var ready bool
+	var err error
+	if req.Named {
+		task, ready, err = local.EnqueueNamed(ctx,
+			req.Id,
+			domain.Command(req.Command),
+			string(req.Payload),
+			int(req.Priority),
+			req.Webhook,
+			int(req.MaxAttempts),
+			visibleAt,
+			req.TenantId,
+		)
+	} else {
+		task, ready, err = local.EnqueueWithID(ctx,
+			req.Id,
+			domain.Command(req.Command),
+			string(req.Payload),
+			int(req.Priority),
+			req.Webhook,
+			int(req.MaxAttempts),
+			req.IdempotencyKey,
+			req.DeduplicationKey,
+			visibleAt,
+			req.TenantId,
+		)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -111,6 +128,23 @@ func (s *Server) Heartbeat(ctx context.Context, req *clusterpb.HeartbeatRequest)
 		}
 	}
 	return &clusterpb.HeartbeatResponse{}, nil
+}
+
+// Progress stores the lease holder's progress value on the local shard.
+func (s *Server) Progress(ctx context.Context, req *clusterpb.ProgressRequest) (*clusterpb.ProgressResponse, error) {
+	if err := s.Tasks.Progress(ctx, req.TaskId, req.WorkerId, req.Progress); err != nil {
+		switch {
+		case isNotFound(err):
+			return &clusterpb.ProgressResponse{NotFound: true}, nil
+		case isNotOwner(err):
+			return &clusterpb.ProgressResponse{NotOwner: true}, nil
+		case isNotInProgress(err):
+			return &clusterpb.ProgressResponse{NotInProgress: true}, nil
+		default:
+			return nil, err
+		}
+	}
+	return &clusterpb.ProgressResponse{}, nil
 }
 
 func (s *Server) Abandon(ctx context.Context, req *clusterpb.AbandonRequest) (*clusterpb.AbandonResponse, error) {
@@ -313,6 +347,7 @@ func domainTaskToProto(t *domain.Task) *clusterpb.Task {
 		TraceParent:       t.TraceParent,
 		TraceState:        t.TraceState,
 		DeduplicationKey:  t.DeduplicationKey,
+		Progress:          t.Progress,
 	}
 }
 
@@ -338,6 +373,7 @@ func protoToDomainTask(p *clusterpb.Task) *domain.Task {
 		TraceParent:       p.TraceParent,
 		TraceState:        p.TraceState,
 		DeduplicationKey:  p.DeduplicationKey,
+		Progress:          p.Progress,
 	}
 	if p.CreatedAt != nil {
 		t.CreatedAt = p.CreatedAt.AsTime()

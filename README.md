@@ -140,6 +140,16 @@ curl -X POST http://localhost:8080/v1/codeq/tasks/claim \
   -d '{"commands":["GENERATE_MASTER"],"leaseSeconds":120,"waitSeconds":10}'
 ```
 
+Report progress while holding the lease (any JSON value up to 64 KiB, kept
+across retries and returned by `GET /v1/codeq/tasks/<id>`):
+
+```bash
+curl -X POST http://localhost:8080/v1/codeq/tasks/<id>/progress \
+  -H 'Authorization: Bearer <worker-token>' \
+  -H 'Content-Type: application/json' \
+  -d '{"progress":{"processed":250,"total":1000}}'
+```
+
 Submit a result:
 
 ```bash
@@ -167,6 +177,26 @@ The first create wins: a joined create's payload, priority and schedule are
 discarded. `deduplicationKey` is also accepted per item in `POST /tasks/batch`
 and on the producer stream, and cannot be combined with `idempotencyKey`
 (`400`). See [ADR 0004](docs/adr/0004-deduplicate-waiting-tasks.md).
+
+### Name the task yourself
+
+Pass `taskId` to create the task under your own identifier and read it back
+by it later. Creating an ID that already exists returns that task to its own
+tenant, so a retried create is safe. Another tenant gets `409` and no task.
+
+```bash
+curl -X POST http://localhost:8080/v1/codeq/tasks \
+  -H 'Authorization: Bearer <producer-token>' \
+  -H 'Content-Type: application/json' \
+  -d '{"command":"EXPORT","payload":{"exportId":"42"},"taskId":"ws-1.export-42"}'
+curl http://localhost:8080/v1/codeq/tasks/ws-1.export-42 -H 'Authorization: Bearer <producer-token>'
+```
+
+IDs have 1–200 characters from `[A-Za-z0-9._:@+-]` and start with a letter or
+digit. `taskId` is also accepted per item in `POST /tasks/batch` and on the
+producer stream. It cannot be combined with `idempotencyKey` or
+`deduplicationKey` (`400`). See
+[ADR 0008](docs/adr/0008-client-chosen-task-ids.md).
 
 ### Queue topic administration
 
@@ -212,6 +242,53 @@ curl 'http://localhost:8080/v1/codeq/admin/queues/GENERATE_MASTER/tasks?state=in
 The response is `{"tasks":[…],"nextCursor":"…"}`; pass `cursor=<nextCursor>`
 to get the next page until `nextCursor` is absent. `limit` defaults to 100
 (max 500). See [ADR 0005](docs/adr/0005-list-tasks-by-queue-state.md).
+
+### Dead-letter administration
+
+A task whose attempts run out is dead-lettered (`FAILED`). An admin can put
+it back on its ready queue as a fresh run (no attempts, no error), drain the
+whole dead-letter queue of a command, or delete a task no worker holds. The
+tenant comes from the token; a task of another tenant answers `404`.
+
+```bash
+# Requeue one task: 200 with the task, 409 task_not_in_dlq if it is not dead-lettered.
+curl -X POST http://localhost:8080/v1/codeq/admin/tasks/<id>/requeue \
+  -H 'Authorization: Bearer <admin-token>'
+
+# Requeue up to `limit` tasks (default 100, max 1000) of a command's dead-letter queue.
+curl -X POST 'http://localhost:8080/v1/codeq/admin/queues/GENERATE_MASTER/dlq/requeue?limit=500' \
+  -H 'Authorization: Bearer <admin-token>'
+
+# Delete a task: 204, or 409 task_in_progress while a worker holds it.
+curl -X DELETE http://localhost:8080/v1/codeq/admin/tasks/<id> \
+  -H 'Authorization: Bearer <admin-token>'
+```
+
+The bulk call answers `{"requeued":n,"remaining":true|false}`; repeat it while
+`remaining` is true. A delete removes the task, its result and its queue entry;
+see [ADR 0009](docs/adr/0009-dlq-operations.md) for what it leaves to the
+retention sweep.
+
+### Recurring schedules
+
+An admin can keep a cron rule next to the queue; codeQ enqueues exactly one
+task per slot, even across restarts and Raft leader changes:
+
+```bash
+curl -X PUT http://localhost:8080/v1/codeq/admin/schedules/nightly-sync \
+  -H 'Authorization: Bearer <admin-token>' \
+  -H 'Content-Type: application/json' \
+  -d '{"cron":"0 3 * * *","timezone":"America/Sao_Paulo","command":"SYNC","payload":{"full":true}}'
+```
+
+`cron` takes the five standard fields or a descriptor (`@hourly`,
+`@every 30s`); `timezone` is an IANA name (UTC by default). The response
+shows `nextRunAt`, `lastRunAt` and `lastTaskId`. `PUT` is idempotent,
+`GET /v1/codeq/admin/schedules[/{name}]` reads, and `DELETE` removes. A
+schedule that missed slots while no leader ran fires once and resumes. In
+Raft mode set `raft.scheduleCatalogProtocol=v1` (or
+`RAFT_SCHEDULE_CATALOG_PROTOCOL=v1`) on every peer once all run a compatible
+build. See [ADR 0006](docs/adr/0006-recurring-schedules.md).
 
 For high-throughput producers and workers, use the gRPC streaming API — a
 long-lived bidirectional stream amortizes auth and pipelines acks. See the

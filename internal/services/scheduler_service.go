@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/url"
 	"strings"
@@ -18,7 +19,7 @@ import (
 )
 
 type SchedulerService interface {
-	CreateTask(ctx context.Context, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey, deduplicationKey string, runAt time.Time, delaySeconds int, tenantID string) (*domain.Task, error)
+	CreateTask(ctx context.Context, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey, deduplicationKey, taskID string, runAt time.Time, delaySeconds int, tenantID string) (*domain.Task, error)
 	ClaimTask(ctx context.Context, workerID string, commands []domain.Command, leaseSeconds int, waitSeconds int, tenantID string) (*domain.Task, bool, error)
 	// ClaimManyTasks pops up to max tasks in one round-trip when the
 	// underlying repo supports batched claim (Pebble does via Phase 7's
@@ -28,15 +29,24 @@ type SchedulerService interface {
 	// polling for the batch path.
 	ClaimManyTasks(ctx context.Context, workerID string, commands []domain.Command, leaseSeconds int, max int, tenantID string) ([]*domain.Task, error)
 	Heartbeat(ctx context.Context, taskID, workerID string, extendSeconds int) error
+	// ReportProgress stores the progress value the lease holder reports for
+	// an in-progress task. It is validated by the caller.
+	ReportProgress(ctx context.Context, taskID, workerID string, progress json.RawMessage) error
 	Abandon(ctx context.Context, taskID, workerID string) error
 	NackTask(ctx context.Context, taskID, workerID string, delaySeconds int, reason string) (int, bool, error)
 	GetTask(ctx context.Context, id string) (*domain.Task, error)
 	AdminQueues(ctx context.Context) (map[string]any, error)
 	QueueStats(ctx context.Context, cmd domain.Command, tenantID string) (*domain.QueueStats, error)
-	// ListTasks pages the tasks of one (cmd, tenant) queue state. limit 0
-	// means DefaultTaskListLimit; a limit outside 1..MaxTaskListLimit fails
-	// with domain.ErrInvalidListLimit.
 	ListTasks(ctx context.Context, cmd domain.Command, tenantID string, state domain.QueueState, limit int, cursor string) (*domain.TaskPage, error)
+	// RequeueDLQTask moves one dead-lettered task back to the ready queue
+	// as a fresh run (ADR 0009).
+	RequeueDLQTask(ctx context.Context, taskID string) (*domain.Task, error)
+	// RequeueDLQ requeues up to limit tasks of a (cmd, tenant) dead-letter
+	// queue. limit 0 means DefaultDLQRequeueLimit; a limit outside
+	// 1..MaxDLQRequeueLimit fails with domain.ErrInvalidRequeueLimit.
+	RequeueDLQ(ctx context.Context, cmd domain.Command, tenantID string, limit int) (*domain.DLQRequeue, error)
+	// DeleteTask removes a task that is not in progress (ADR 0009).
+	DeleteTask(ctx context.Context, taskID string) error
 
 	// Novo: limpeza administrativa por índice Z
 	CleanupExpired(ctx context.Context, limit int, before time.Time) (int, error)
@@ -85,7 +95,7 @@ func NewSchedulerService(repo repository.TaskRepository, notifier NotifierServic
 // command, a webhook that is not an absolute http(s) URL, or both an
 // idempotency and a deduplication key. It marks the span the same way the
 // inline checks it replaces did.
-func validateCreate(span trace.Span, cmd domain.Command, webhook, idempotencyKey, deduplicationKey string) error {
+func validateCreate(span trace.Span, cmd domain.Command, webhook, idempotencyKey, deduplicationKey, taskID string) error {
 	if strings.TrimSpace(string(cmd)) == "" {
 		span.SetStatus(codes.Error, "invalid command")
 		return errors.New("invalid command")
@@ -101,6 +111,27 @@ func validateCreate(span trace.Span, cmd domain.Command, webhook, idempotencyKey
 	if idempotencyKey != "" && deduplicationKey != "" {
 		span.SetStatus(codes.Error, domain.ErrDeduplicationWithIdempotency.Error())
 		return domain.ErrDeduplicationWithIdempotency
+	}
+	return validateTaskID(span, idempotencyKey, deduplicationKey, taskID)
+}
+
+// validateTaskID rejects a client-chosen ID that is malformed or combined
+// with another create key. An empty ID means the server chooses one.
+func validateTaskID(span trace.Span, idempotencyKey, deduplicationKey, taskID string) error {
+	if taskID == "" {
+		return nil
+	}
+	if !domain.ValidTaskID(taskID) {
+		span.SetStatus(codes.Error, domain.ErrInvalidTaskID.Error())
+		return domain.ErrInvalidTaskID
+	}
+	if idempotencyKey != "" {
+		span.SetStatus(codes.Error, domain.ErrTaskIDWithIdempotency.Error())
+		return domain.ErrTaskIDWithIdempotency
+	}
+	if deduplicationKey != "" {
+		span.SetStatus(codes.Error, domain.ErrTaskIDWithDeduplication.Error())
+		return domain.ErrTaskIDWithDeduplication
 	}
 	return nil
 }
@@ -119,7 +150,7 @@ func (s *schedulerService) visibleAt(runAt time.Time, delaySeconds int) time.Tim
 
 // CreateTask validates and enqueues a task, or returns the task an
 // idempotency or deduplication key resolves to.
-func (s *schedulerService) CreateTask(ctx context.Context, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey, deduplicationKey string, runAt time.Time, delaySeconds int, tenantID string) (*domain.Task, error) {
+func (s *schedulerService) CreateTask(ctx context.Context, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey, deduplicationKey, taskID string, runAt time.Time, delaySeconds int, tenantID string) (*domain.Task, error) {
 	ctx, span := otel.Tracer("codeq/scheduler").Start(ctx, "codeq.task.create",
 		trace.WithAttributes(
 			attribute.String("codeq.command", string(cmd)),
@@ -136,7 +167,7 @@ func (s *schedulerService) CreateTask(ctx context.Context, cmd domain.Command, p
 		span.SetAttributes(attribute.Bool("codeq.has_deduplication_key", true))
 	}
 
-	if err := validateCreate(span, cmd, webhook, idempotencyKey, deduplicationKey); err != nil {
+	if err := validateCreate(span, cmd, webhook, idempotencyKey, deduplicationKey, taskID); err != nil {
 		return nil, err
 	}
 	if maxAttempts <= 0 {
@@ -144,7 +175,7 @@ func (s *schedulerService) CreateTask(ctx context.Context, cmd domain.Command, p
 	}
 	visibleAt := s.visibleAt(runAt, delaySeconds)
 
-	task, ready, err := s.repo.EnqueueWithReady(ctx, cmd, payload, priority, webhook, maxAttempts, idempotencyKey, deduplicationKey, visibleAt, tenantID)
+	task, ready, err := s.repo.EnqueueWithReady(ctx, cmd, payload, priority, webhook, maxAttempts, idempotencyKey, deduplicationKey, taskID, visibleAt, tenantID)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
@@ -256,6 +287,11 @@ func (s *schedulerService) Heartbeat(ctx context.Context, taskID, workerID strin
 	return s.repo.Heartbeat(ctx, taskID, workerID, extendSeconds)
 }
 
+// ReportProgress passes the validated progress value to the repository.
+func (s *schedulerService) ReportProgress(ctx context.Context, taskID, workerID string, progress json.RawMessage) error {
+	return s.repo.Progress(ctx, taskID, workerID, progress)
+}
+
 func (s *schedulerService) Abandon(ctx context.Context, taskID, workerID string) error {
 	return s.repo.Abandon(ctx, taskID, workerID)
 }
@@ -344,4 +380,57 @@ func (s *schedulerService) CleanupExpired(ctx context.Context, limit int, before
 		limit = 1000
 	}
 	return s.repo.CleanupExpired(ctx, limit, before)
+}
+
+const (
+	// DefaultDLQRequeueLimit is the number of tasks a bulk requeue moves
+	// when the caller sets no limit.
+	DefaultDLQRequeueLimit = 100
+	// MaxDLQRequeueLimit bounds one bulk requeue call. The repository
+	// commits in small chunks; this caps how long one HTTP call runs.
+	MaxDLQRequeueLimit = 1000
+)
+
+// RequeueDLQTask requeues one dead-lettered task and wakes the workers
+// subscribed to its command.
+func (s *schedulerService) RequeueDLQTask(ctx context.Context, taskID string) (*domain.Task, error) {
+	task, err := s.repo.RequeueDLQTask(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	s.notifyReady(ctx, task.Command)
+	return task, nil
+}
+
+// RequeueDLQ validates the request, requeues one page of the dead-letter
+// queue and wakes the subscribed workers when anything moved.
+func (s *schedulerService) RequeueDLQ(ctx context.Context, cmd domain.Command, tenantID string, limit int) (*domain.DLQRequeue, error) {
+	if strings.TrimSpace(string(cmd)) == "" {
+		return nil, errors.New("invalid command")
+	}
+	if limit == 0 {
+		limit = DefaultDLQRequeueLimit
+	}
+	if limit < 1 || limit > MaxDLQRequeueLimit {
+		return nil, domain.ErrInvalidRequeueLimit
+	}
+	out, err := s.repo.RequeueDLQ(ctx, cmd, tenantID, limit)
+	if err != nil {
+		return nil, err
+	}
+	if out.Requeued > 0 {
+		s.notifyReady(ctx, cmd)
+	}
+	return out, nil
+}
+
+// DeleteTask deletes a task that is not in progress.
+func (s *schedulerService) DeleteTask(ctx context.Context, taskID string) error {
+	return s.repo.DeleteTask(ctx, taskID)
+}
+
+func (s *schedulerService) notifyReady(ctx context.Context, cmd domain.Command) {
+	if s.notifier != nil {
+		s.notifier.NotifyQueueReady(ctx, cmd)
+	}
 }

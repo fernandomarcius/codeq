@@ -1,9 +1,11 @@
 package app
 
 import (
+	schedulesapp "github.com/osvaldoandrade/codeq/internal/application/schedules"
 	topicsapp "github.com/osvaldoandrade/codeq/internal/application/topics"
 	"github.com/osvaldoandrade/codeq/internal/controllers"
 	"github.com/osvaldoandrade/codeq/internal/middleware"
+	scheduleshttp "github.com/osvaldoandrade/codeq/internal/server/http/schedules"
 	topicshttp "github.com/osvaldoandrade/codeq/internal/server/http/topics"
 
 	"github.com/gin-gonic/gin"
@@ -30,6 +32,7 @@ func SetupMappings(app *Application) {
 		worker.POST("/tasks/claim", middleware.RequireWorkerScope("codeq:claim"), fwd.Claim(), middleware.RateLimitWorkerClaim(app.RateLimiter, app.Config), controllers.NewClaimTaskController(app.Scheduler).Handle)
 		worker.POST("/tasks/claim/batch", middleware.RequireWorkerScope("codeq:claim"), fwd.Batch(), middleware.RateLimitWorkerClaim(app.RateLimiter, app.Config), controllers.NewBatchClaimTaskController(app.Scheduler).Handle)
 		worker.POST("/tasks/:id/heartbeat", middleware.RequireWorkerScope("codeq:heartbeat"), fwd.Single(), controllers.NewHeartbeatController(app.Scheduler).Handle)
+		worker.POST("/tasks/:id/progress", middleware.RequireWorkerScope("codeq:heartbeat"), fwd.Single(), controllers.NewProgressController(app.Scheduler).Handle)
 		worker.POST("/tasks/:id/abandon", middleware.RequireWorkerScope("codeq:abandon"), fwd.Single(), controllers.NewAbandonController(app.Scheduler).Handle)
 		worker.POST("/tasks/:id/nack", middleware.RequireWorkerScope("codeq:nack"), fwd.Single(), controllers.NewNackController(app.Scheduler).Handle)
 		worker.POST("/tasks/:id/result", middleware.RequireWorkerScope("codeq:result"), fwd.Single(), controllers.NewSubmitResultController(app.Results).Handle)
@@ -56,8 +59,22 @@ func SetupMappings(app *Application) {
 		topicAdmin.PUT("/topics/:topicName", fwd.Single(), topicHandler.Upsert)
 		topicAdmin.GET("/topics/:topicName", topicHandler.Get)
 		topicAdmin.DELETE("/topics/:topicName", fwd.Single(), topicHandler.Delete)
+		scheduleService := app.Schedules
+		if scheduleService == nil {
+			scheduleService = schedulesapp.NewUnavailableService("schedule service not configured")
+		}
+		scheduleHandler := scheduleshttp.NewHandler(scheduleService)
+		admin.PUT("/schedules/:name", fwd.Single(), scheduleHandler.Upsert)
+		admin.GET("/schedules/:name", scheduleHandler.Get)
+		admin.GET("/schedules", scheduleHandler.List)
+		admin.DELETE("/schedules/:name", fwd.Single(), scheduleHandler.Delete)
 		admin.GET("/queues", controllers.NewQueuesAdminController(app.Scheduler).Handle)
 		admin.GET("/queues/:command/tasks", controllers.NewListTasksController(app.Scheduler).Handle)
+		// Dead-letter administration (ADR 0009). By-ID writes forward like
+		// any single-task write; the bulk requeue is gated like a batch.
+		admin.POST("/tasks/:id/requeue", fwd.Single(), controllers.NewRequeueTaskController(app.Scheduler).Handle)
+		admin.DELETE("/tasks/:id", fwd.Single(), controllers.NewDeleteTaskController(app.Scheduler).Handle)
+		admin.POST("/queues/:command/dlq/requeue", fwd.Batch(), controllers.NewRequeueDLQController(app.Scheduler).Handle)
 		topicAdmin.GET("/queues/:command", controllers.NewQueueStatsController(app.Scheduler).Handle)
 
 		// Novo: limpeza administrativa de tasks expiradas no índice Z

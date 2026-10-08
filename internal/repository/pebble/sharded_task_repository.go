@@ -2,6 +2,7 @@ package pebble
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"hash/fnv"
 	"strconv"
@@ -75,14 +76,24 @@ func (s *ShardedTaskRepository) nextStart() int {
 
 // Enqueue creates a task on the shard its ID (or its idempotency or
 // deduplication key) routes to. See EnqueueWithReady.
-func (s *ShardedTaskRepository) Enqueue(ctx context.Context, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey, deduplicationKey string, visibleAt time.Time, tenantID string) (*domain.Task, error) {
-	task, _, err := s.EnqueueWithReady(ctx, cmd, payload, priority, webhook, maxAttempts, idempotencyKey, deduplicationKey, visibleAt, tenantID)
+func (s *ShardedTaskRepository) Enqueue(ctx context.Context, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey, deduplicationKey, taskID string, visibleAt time.Time, tenantID string) (*domain.Task, error) {
+	task, _, err := s.EnqueueWithReady(ctx, cmd, payload, priority, webhook, maxAttempts, idempotencyKey, deduplicationKey, taskID, visibleAt, tenantID)
 	return task, err
 }
 
 // EnqueueWithReady is Enqueue that also reports whether the new task is
-// immediately ready to claim.
-func (s *ShardedTaskRepository) EnqueueWithReady(ctx context.Context, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey, deduplicationKey string, visibleAt time.Time, tenantID string) (*domain.Task, bool, error) {
+// immediately ready to claim. A client-chosen task ID is stored on the shard
+// that owns that ID, and the existence check runs there.
+func (s *ShardedTaskRepository) EnqueueWithReady(ctx context.Context, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey, deduplicationKey, taskID string, visibleAt time.Time, tenantID string) (*domain.Task, bool, error) {
+	if taskID != "" {
+		if idempotencyKey != "" {
+			return nil, false, domain.ErrTaskIDWithIdempotency
+		}
+		if deduplicationKey != "" {
+			return nil, false, domain.ErrTaskIDWithDeduplication
+		}
+		return s.shards[s.shardOf(taskID)].EnqueueNamed(ctx, taskID, cmd, payload, priority, webhook, maxAttempts, visibleAt, tenantID)
+	}
 	// Idempotency check against its own shard first.
 	if idempotencyKey != "" {
 		idShard := s.shardOf(idempotencyKey)
@@ -176,6 +187,11 @@ func (s *ShardedTaskRepository) ClaimMany(ctx context.Context, workerID string, 
 
 func (s *ShardedTaskRepository) Heartbeat(ctx context.Context, taskID string, workerID string, extendSeconds int) error {
 	return s.shards[s.shardOf(taskID)].Heartbeat(ctx, taskID, workerID, extendSeconds)
+}
+
+// Progress routes to the shard that owns taskID.
+func (s *ShardedTaskRepository) Progress(ctx context.Context, taskID string, workerID string, progress json.RawMessage) error {
+	return s.shards[s.shardOf(taskID)].Progress(ctx, taskID, workerID, progress)
 }
 
 func (s *ShardedTaskRepository) Abandon(ctx context.Context, taskID string, workerID string) error {
@@ -280,5 +296,91 @@ func (s *ShardedTaskRepository) CleanupExpired(ctx context.Context, limit int, b
 	return total, nil
 }
 
+// RequeueDLQTask routes to the shard that owns taskID.
+func (s *ShardedTaskRepository) RequeueDLQTask(ctx context.Context, taskID string) (*domain.Task, error) {
+	return s.shards[s.shardOf(taskID)].RequeueDLQTask(ctx, taskID)
+}
+
+// DeleteTask routes to the shard that owns taskID.
+func (s *ShardedTaskRepository) DeleteTask(ctx context.Context, taskID string) error {
+	return s.shards[s.shardOf(taskID)].DeleteTask(ctx, taskID)
+}
+
+// RequeueDLQ walks the shards in order, requeueing up to limit tasks on the
+// shards this node leads. A shard led elsewhere is skipped but still counts
+// toward Remaining. When the led shards moved nothing and a shard led
+// elsewhere still holds entries, its not-leader error is returned so the
+// HTTP layer forwards the call to that shard's leader: a client repeating
+// the call while Remaining is true always reaches a node that can progress.
+func (s *ShardedTaskRepository) RequeueDLQ(ctx context.Context, cmd domain.Command, tenantID string, limit int) (*domain.DLQRequeue, error) {
+	out := &domain.DLQRequeue{}
+	var elsewhere error
+	for _, sh := range s.shards {
+		res, redirect, err := requeueOrDefer(ctx, sh, cmd, tenantID, limit-out.Requeued)
+		if err != nil {
+			return nil, err
+		}
+		if elsewhere == nil {
+			elsewhere = redirect
+		}
+		out.Requeued += res.Requeued
+		out.Remaining = out.Remaining || res.Remaining
+	}
+	if out.Requeued == 0 && elsewhere != nil {
+		return nil, elsewhere
+	}
+	return out, nil
+}
+
+// requeueOrDefer requeues on a shard this node leads. On a shard led
+// elsewhere it moves nothing, reports whether that shard still holds
+// entries and, when it does, returns the shard's not-leader error as
+// redirect.
+func requeueOrDefer(ctx context.Context, sh *TaskRepository, cmd domain.Command, tenantID string, limit int) (res *domain.DLQRequeue, redirect, err error) {
+	res, notLeader := sh.RequeueDLQ(ctx, cmd, tenantID, limit)
+	if !isNotLeader(notLeader) {
+		return res, nil, notLeader
+	}
+	waiting, err := sh.hasDLQ(cmd, tenantID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if waiting {
+		redirect = notLeader
+	}
+	return &domain.DLQRequeue{Remaining: waiting}, redirect, nil
+}
+
 // ---- compile-time check ----
 var _ repository.TaskRepository = (*ShardedTaskRepository)(nil)
+
+// OnShard returns a view of the sharded repository whose creates place the
+// task, and its idempotency mapping, on shard idx; every other method is the
+// sharded one. A writer that leads only that shard's Raft group (the
+// recurring schedule runner leads the catalog shard) can then enqueue
+// without depending on the leaders of the other shards.
+func (s *ShardedTaskRepository) OnShard(idx int) repository.TaskRepository {
+	return &shardPinnedRepository{ShardedTaskRepository: s, idx: idx}
+}
+
+type shardPinnedRepository struct {
+	*ShardedTaskRepository
+	idx int
+}
+
+// Enqueue creates the task on the pinned shard.
+func (p *shardPinnedRepository) Enqueue(ctx context.Context, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey, deduplicationKey, taskID string, visibleAt time.Time, tenantID string) (*domain.Task, error) {
+	task, _, err := p.EnqueueWithReady(ctx, cmd, payload, priority, webhook, maxAttempts, idempotencyKey, deduplicationKey, taskID, visibleAt, tenantID)
+	return task, err
+}
+
+// EnqueueWithReady creates the task on the pinned shard with an ID that
+// shard owns, so every later lookup by ID routes back to it. A client-chosen
+// ID or a deduplication key keeps the ordinary routing: those keys decide
+// their own shard.
+func (p *shardPinnedRepository) EnqueueWithReady(ctx context.Context, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey, deduplicationKey, taskID string, visibleAt time.Time, tenantID string) (*domain.Task, bool, error) {
+	if taskID != "" || deduplicationKey != "" {
+		return p.ShardedTaskRepository.EnqueueWithReady(ctx, cmd, payload, priority, webhook, maxAttempts, idempotencyKey, deduplicationKey, taskID, visibleAt, tenantID)
+	}
+	return p.shards[p.idx].EnqueueWithID(ctx, p.idOnShard(p.idx), cmd, payload, priority, webhook, maxAttempts, idempotencyKey, "", visibleAt, tenantID)
+}
