@@ -122,11 +122,15 @@ func (s *schedulerService) CreateTask(ctx context.Context, cmd domain.Command, p
 			attribute.Int("codeq.priority", priority),
 			attribute.Bool("codeq.has_webhook", strings.TrimSpace(webhook) != ""),
 			attribute.Bool("codeq.has_idempotency_key", strings.TrimSpace(idempotencyKey) != ""),
-			attribute.Bool("codeq.has_deduplication_key", deduplicationKey != ""),
 			attribute.String("codeq.tenant_id", tenantID),
 		),
 	)
 	defer span.End()
+	if deduplicationKey != "" {
+		// Set only when present: an attribute in the start options costs an
+		// allocation on every create, including the ones without a key.
+		span.SetAttributes(attribute.Bool("codeq.has_deduplication_key", true))
+	}
 
 	if err := validateCreate(span, cmd, webhook, idempotencyKey, deduplicationKey); err != nil {
 		return nil, err
