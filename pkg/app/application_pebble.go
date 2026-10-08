@@ -437,6 +437,8 @@ func newPebbleApplication(
 	// leads shard 0 but follows shard 1 only sweeps shard 0.
 	for i, shardDB := range dbs {
 		opts := reaperOpts // value copy keeps DLQCallback shared
+		repo := taskShards[i]
+		opts.OnDelayed = repo.NoteDelayed
 		if cfg.Raft.Enabled && raftNodes[i] != nil {
 			ref := raftNodes[i]
 			opts.LeaderGate = ref.IsLeader

@@ -205,6 +205,22 @@ func (d *DB) Raw() *pebbledb.DB { return d.db }
 // existing pending keys so new enqueues sort after old ones.
 func (d *DB) NextSeq() uint64 { return d.seq.Add(1) }
 
+// RaiseSeq moves the pending-sequence high-water mark up to floor when
+// the current value is lower. Leadership rebuild uses it so a new
+// leader does not reuse sequence numbers already committed by the
+// previous one. It never moves the counter backwards.
+func (d *DB) RaiseSeq(floor uint64) {
+	for {
+		cur := d.seq.Load()
+		if cur >= floor {
+			return
+		}
+		if d.seq.CompareAndSwap(cur, floor) {
+			return
+		}
+	}
+}
+
 // recoverSeq scans all pending keys and sets seq to max+1. Linear in the
 // pending-queue size at startup; for very large queues we could persist a
 // checkpoint, but the workloads we care about fit comfortably.
