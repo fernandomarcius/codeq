@@ -157,13 +157,14 @@ func TestResultsServiceBatchSubmit(t *testing.T) {
 }
 
 func TestResultsServiceSubmit(t *testing.T) {
+	const workerID = "submit-worker"
 	stores := openPebbleStores(t)
 	ctx := context.Background()
 	_, err := stores.tasks.Enqueue(ctx, domain.CmdGenerateMaster, `{"k":"v"}`, 0, "https://example.com/hook", 5, "", time.Time{}, "tenant-a")
 	if err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
-	claimed, ok, err := stores.tasks.Claim(ctx, "worker-1", []domain.Command{domain.CmdGenerateMaster}, 30, 1, 5, "tenant-a")
+	claimed, ok, err := stores.tasks.Claim(ctx, workerID, []domain.Command{domain.CmdGenerateMaster}, 30, 1, 5, "tenant-a")
 	if err != nil || !ok || claimed == nil {
 		t.Fatalf("claim: ok=%v err=%v", ok, err)
 	}
@@ -184,18 +185,18 @@ func TestResultsServiceSubmit(t *testing.T) {
 	if _, err := svc.Submit(ctx, claimed.ID, domain.SubmitResultRequest{WorkerID: "other", Status: domain.StatusCompleted, Result: map[string]any{"ok": true}}); err == nil || err.Error() != "not-owner" {
 		t.Fatalf("wrong worker: %v", err)
 	}
-	if _, err := svc.Submit(ctx, claimed.ID, domain.SubmitResultRequest{WorkerID: "worker-1", Status: domain.StatusCompleted}); err == nil || err.Error() != "result required when status=COMPLETED" {
+	if _, err := svc.Submit(ctx, claimed.ID, domain.SubmitResultRequest{WorkerID: workerID, Status: domain.StatusCompleted}); err == nil || err.Error() != "result required when status=COMPLETED" {
 		t.Fatalf("missing result: %v", err)
 	}
-	if _, err := svc.Submit(ctx, claimed.ID, domain.SubmitResultRequest{WorkerID: "worker-1", Status: domain.StatusFailed}); err == nil || err.Error() != "error required when status=FAILED" {
+	if _, err := svc.Submit(ctx, claimed.ID, domain.SubmitResultRequest{WorkerID: workerID, Status: domain.StatusFailed}); err == nil || err.Error() != "error required when status=FAILED" {
 		t.Fatalf("missing error: %v", err)
 	}
-	if _, err := svc.Submit(ctx, claimed.ID, domain.SubmitResultRequest{WorkerID: "worker-1", Status: "NOPE"}); err == nil || err.Error() != "invalid status" {
+	if _, err := svc.Submit(ctx, claimed.ID, domain.SubmitResultRequest{WorkerID: workerID, Status: "NOPE"}); err == nil || err.Error() != "invalid status" {
 		t.Fatalf("invalid status: %v", err)
 	}
 
 	rec, err := svc.Submit(ctx, claimed.ID, domain.SubmitResultRequest{
-		WorkerID: "worker-1",
+		WorkerID: workerID,
 		Status:   domain.StatusCompleted,
 		Result:   map[string]any{"ok": true},
 		Artifacts: []domain.ArtifactIn{

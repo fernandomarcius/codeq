@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -270,7 +271,8 @@ func applyShardTransport(cfg *config.Config, mux *raftpkg.MuxAcceptor, idx int, 
 }
 
 func applyMuxShard(cfg *config.Config, mux *raftpkg.MuxAcceptor, idx int, raftCfg *raftpkg.Config) error {
-	sl, err := mux.RegisterGroup(uint32(idx))
+	// Shard index is a configured count, not an untrusted integer.
+	sl, err := mux.RegisterGroup(uint32(idx)) // #nosec G115 -- idx is a small non-negative shard number
 	if err != nil {
 		return fmt.Errorf("raft mux register shard %d: %w", idx, err)
 	}
@@ -358,7 +360,7 @@ func (rt *pebbleRuntime) startCluster() error {
 }
 
 func serveClusterGRPC(srv *grpc.Server, lis net.Listener, logger *slog.Logger) {
-	if err := srv.Serve(lis); err != nil && err != grpc.ErrServerStopped {
+	if err := srv.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 		logger.Error("cluster gRPC server stopped", "err", err)
 	}
 }
