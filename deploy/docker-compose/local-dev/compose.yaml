@@ -1,25 +1,18 @@
 name: codeq-dev
 
 services:
-  kvrocks:
-    image: apache/kvrocks:latest
-    ports:
-      - "${KVROCKS_PORT:-6666}:6666"
-    volumes:
-      - kvrocks-data:/var/lib/kvrocks
-    restart: unless-stopped
-
   codeq:
     image: golang:1.23
     working_dir: /app
     volumes:
       - ../../../:/app
+      - codeq-pebble:/var/lib/codeq/pebble
     ports:
       - "${CODEQ_PORT:-8080}:8080"
     environment:
       - PORT=8080
-      - REDIS_ADDR=kvrocks:6666
-      - REDIS_PASSWORD=
+      - PERSISTENCE_PROVIDER=pebble
+      - PERSISTENCE_CONFIG={"path":"/var/lib/codeq/pebble"}
       - ENV=dev
       - LOG_LEVEL=debug
       - LOG_FORMAT=text
@@ -33,8 +26,6 @@ services:
       - TRACING_OTLP_ENDPOINT=${TRACING_OTLP_ENDPOINT:-jaeger:4317}
       - TRACING_OTLP_INSECURE=${TRACING_OTLP_INSECURE:-true}
       - TRACING_SAMPLE_RATIO=${TRACING_SAMPLE_RATIO:-1.0}
-    depends_on:
-      - kvrocks
     command: ["sh", "-c", "go run ./cmd/server"]
     restart: unless-stopped
     healthcheck:
@@ -124,4 +115,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  kvrocks-data:
+  codeq-pebble:

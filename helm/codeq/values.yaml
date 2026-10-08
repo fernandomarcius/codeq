@@ -52,7 +52,6 @@ extraVolumeMounts: []
 
 config:
   port: 8080
-  redisAddr: "127.0.0.1:6379"
   identityServiceUrl: "http://api.codecompany.ai"
   timezone: "America/Sao_Paulo"
   logLevel: "info"
@@ -86,9 +85,14 @@ persistence:
     enabled: false
     size: 1Gi
     storageClass: ""
+  pebble:
+    enabled: true
+    size: 4Gi
+    storageClass: ""
+    path: /var/lib/codeq/pebble
 
 kvrocks:
-  enabled: true
+  enabled: false
   image:
     repository: apache/kvrocks
     tag: "2.7.0"

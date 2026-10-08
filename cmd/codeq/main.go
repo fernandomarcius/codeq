@@ -1115,7 +1115,7 @@ func installCmd(ui *ui) *cobra.Command {
 	cmd.Flags().StringVar(&opts.OutputDir, "output-dir", opts.OutputDir, "Directory for generated install files")
 	cmd.Flags().StringVar(&opts.Image, "image", opts.Image, "codeQ server image")
 	cmd.Flags().StringVar(&opts.Domain, "domain", opts.Domain, "Ingress host for Kubernetes")
-	cmd.Flags().StringVar(&opts.RedisAddr, "redis-addr", opts.RedisAddr, "External Redis/KVRocks address")
+	cmd.Flags().StringVar(&opts.RedisAddr, "redis-addr", opts.RedisAddr, "Ignored. CodeQ persists on Pebble")
 	cmd.Flags().StringVar(&opts.IdentityServiceURL, "identity-service-url", opts.IdentityServiceURL, "Producer identity service base URL")
 	cmd.Flags().StringVar(&opts.WorkerJwksURL, "worker-jwks-url", opts.WorkerJwksURL, "Worker JWKS URL")
 	cmd.Flags().StringVar(&opts.WorkerIssuer, "worker-issuer", opts.WorkerIssuer, "Worker token issuer")
@@ -1251,9 +1251,6 @@ func runInstallWizard(opts *installOptions) error {
 		opts.WorkerIssuer = prompt(reader, "Worker issuer", opts.WorkerIssuer)
 		opts.WorkerAudience = prompt(reader, "Worker audience", emptyOr(opts.WorkerAudience, "codeq-worker"))
 	}
-	if opts.Target == "kubernetes" || !profile.EmbeddedKVRocks {
-		opts.RedisAddr = prompt(reader, "External KVRocks/Redis address (blank for embedded when supported)", opts.RedisAddr)
-	}
 	if opts.WebhookHmacSecret == "" {
 		opts.WebhookHmacSecret = prompt(reader, "Webhook HMAC secret (blank to generate)", "")
 	}
@@ -1345,8 +1342,8 @@ services:
       ENV: ${CODEQ_ENV}
       LOG_LEVEL: ${CODEQ_LOG_LEVEL}
       LOG_FORMAT: json
-      REDIS_ADDR: ${REDIS_ADDR}
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      PERSISTENCE_PROVIDER: pebble
+      PERSISTENCE_CONFIG: '{"path":"/var/lib/codeq/pebble"}'
       IDENTITY_SERVICE_URL: ${IDENTITY_SERVICE_URL}
       WORKER_JWKS_URL: ${WORKER_JWKS_URL}
       WORKER_ISSUER: ${WORKER_ISSUER}
@@ -1369,27 +1366,16 @@ services:
       TRACING_OTLP_ENDPOINT: ${TRACING_OTLP_ENDPOINT:-}
       TRACING_OTLP_INSECURE: ${TRACING_OTLP_INSECURE}
       TRACING_SAMPLE_RATIO: ${TRACING_SAMPLE_RATIO}
-    depends_on:
-      - kvrocks
     volumes:
       - codeq-artifacts:/var/lib/codeq/artifacts
-    restart: unless-stopped
-    networks:
-      - codeq
-
-  kvrocks:
-    image: apache/kvrocks:2.7.0
-    ports:
-      - "${KVROCKS_PORT:-6666}:6666"
-    volumes:
-      - kvrocks-data:/var/lib/kvrocks
+      - codeq-pebble:/var/lib/codeq/pebble
     restart: unless-stopped
     networks:
       - codeq
 
 volumes:
   codeq-artifacts:
-  kvrocks-data:
+  codeq-pebble:
 
 networks:
   codeq:
@@ -1420,19 +1406,13 @@ func renderDockerInstallEnv(opts installOptions, profile installProfile) string 
 		workerAuthProvider = "static"
 		workerAuthConfig = `{"token":"dev-token","subject":"worker-dev","scopes":["codeq:claim","codeq:heartbeat","codeq:abandon","codeq:nack","codeq:result","codeq:subscribe"],"eventTypes":["*"]}`
 	}
-	redisAddr := opts.RedisAddr
-	if strings.TrimSpace(redisAddr) == "" {
-		redisAddr = "kvrocks:6666"
-	}
-
 	lines := []string{
 		envKV("CODEQ_IMAGE", opts.Image),
 		envKV("CODEQ_PORT", "8080"),
 		envKV("CODEQ_ENV", envMode),
 		envKV("CODEQ_LOG_LEVEL", logLevel),
-		envKV("REDIS_ADDR", redisAddr),
-		envKV("REDIS_PASSWORD", ""),
-		envKV("KVROCKS_PORT", "6666"),
+		envKV("PERSISTENCE_PROVIDER", "pebble"),
+		envKV("PERSISTENCE_CONFIG", `{"path":"/var/lib/codeq/pebble"}`),
 		envKV("IDENTITY_SERVICE_URL", identityURL),
 		envKV("WORKER_JWKS_URL", workerJwksURL),
 		envKV("WORKER_ISSUER", workerIssuer),
@@ -1460,15 +1440,7 @@ func renderDockerInstallEnv(opts installOptions, profile installProfile) string 
 func renderHelmInstallValues(opts installOptions, profile installProfile) (string, []string) {
 	var warnings []string
 	imageRepo, imageTag := splitImageRef(opts.Image)
-	redisAddr := strings.TrimSpace(opts.RedisAddr)
-	embeddedKVRocks := profile.EmbeddedKVRocks && redisAddr == ""
-	if !embeddedKVRocks && redisAddr == "" {
-		redisAddr = "CHANGE_ME_KVROCKS:6666"
-		warnings = append(warnings, profile.Name+" profile expects an external KVRocks/Redis address; set --redis-addr before executing.")
-	}
-	if embeddedKVRocks {
-		redisAddr = "127.0.0.1:6379"
-	}
+	embeddedKVRocks := false
 
 	envMode := "prod"
 	logLevel := "info"
@@ -1513,7 +1485,7 @@ config:
   env: %q
   logLevel: %q
   logFormat: json
-  redisAddr: %q
+  persistenceProvider: pebble
   identityServiceUrl: %q
   workerJwksUrl: %q
   workerIssuer: %q
@@ -1563,7 +1535,7 @@ persistence:
     size: %q
 
 %s
-%s`, imageRepo, imageTag, profile.Replicas, envMode, logLevel, redisAddr,
+%s`, imageRepo, imageTag, profile.Replicas, envMode, logLevel,
 		opts.IdentityServiceURL, opts.WorkerJwksURL, opts.WorkerIssuer, emptyOr(opts.WorkerAudience, "codeq-worker"),
 		allowProducerAsWorker, profile.RequeueInspectLimit, opts.WebhookHmacSecret,
 		profile.Name != "dev", profile.MinReplicas, profile.MaxReplicas, profile.TargetCPU,
@@ -1590,9 +1562,6 @@ func validateExecutableInstall(opts installOptions, profile installProfile) erro
 	}
 	if strings.Contains(opts.WorkerIssuer, "example.com") || strings.TrimSpace(opts.WorkerIssuer) == "" {
 		missing = append(missing, "--worker-issuer")
-	}
-	if opts.Target == "kubernetes" && !profile.EmbeddedKVRocks && strings.TrimSpace(opts.RedisAddr) == "" {
-		missing = append(missing, "--redis-addr")
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("refusing --execute with placeholder production settings; provide %s", strings.Join(missing, ", "))

@@ -12,13 +12,13 @@ independent change:
 
 - `pkg/app/Application` is a god-object exposing 11 internal services as
   a public surface.
-- `pkg/config/Config` is a 689-line struct mixing HTTP, gRPC, Redis,
-  Pebble, Raft, auth, sharding, and observability.
-- `pkg/persistence` ships Redis and in-memory implementations, leaking
+- `pkg/config/Config` is a large struct mixing HTTP, gRPC, Pebble,
+  Raft, auth, sharding, and observability.
+- `pkg/persistence` keeps a plugin interface. The server persists on Pebble, leaking
   infrastructure into the public API.
 - Core task algorithms (`Claim`, `Enqueue`, `MoveDueDelayed`) are
-  duplicated across three places (Redis repo, Pebble repo, cluster
-  router) with no shared contract.
+  duplicated across the Pebble repository and the cluster
+  router, with no shared contract.
 - `internal/services/scheduler_service.go` is 541 lines / 12 fields and
   owns task creation, claiming, retry, webhook coordination, and admin.
 - There is no enforced rule that domain logic stays free of HTTP or DB
@@ -48,7 +48,7 @@ internal/                  private implementation
   core/                    pure domain: model, policy, errors
   application/             use-cases (TaskCreator, TaskClaimer, ...)
   storage/
-    adapter/redis/         Redis adapter
+    adapter/pebble/        Pebble adapter
     adapter/pebble/        Pebble adapter
   cluster/                 routing, ring, bloom, raft group coordination
   replication/             Raft FSM, log/snapshot stores, mux transport

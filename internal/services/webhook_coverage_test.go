@@ -8,11 +8,7 @@ import (
 	"time"
 
 	"github.com/osvaldoandrade/codeq/internal/ratelimit"
-	"github.com/osvaldoandrade/codeq/internal/repository"
 	"github.com/osvaldoandrade/codeq/pkg/domain"
-
-	"github.com/alicebob/miniredis/v2"
-	"github.com/go-redis/redis/v8"
 )
 
 // captureCallback records every Send invocation so tests can assert
@@ -43,19 +39,15 @@ func (c *captureCallback) snapshot() []captureEntry {
 }
 
 func TestBatchSubmitFiresCallbackPerItem(t *testing.T) {
-	mr, _ := miniredis.Run()
-	defer mr.Close()
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	defer rdb.Close()
-
-	taskRepo := repository.NewTaskRepository(rdb, time.UTC, "exp_full_jitter", 1, 10, nil)
+	stores := openPebbleStores(t)
+	taskRepo := stores.tasks
 	t1, _ := taskRepo.Enqueue(context.Background(), domain.CmdGenerateMaster, `{"k":1}`, 0, "https://hook.example/1", 5, "", time.Time{}, "")
 	t2, _ := taskRepo.Enqueue(context.Background(), domain.CmdGenerateMaster, `{"k":2}`, 0, "https://hook.example/2", 5, "", time.Time{}, "")
 	cmds := []domain.Command{domain.CmdGenerateMaster}
 	_, _, _ = taskRepo.Claim(context.Background(), "w1", cmds, 30, 1, 5, "")
 	_, _, _ = taskRepo.Claim(context.Background(), "w1", cmds, 30, 1, 5, "")
 
-	resultRepo := repository.NewResultRepository(rdb, time.UTC, nil)
+	resultRepo := stores.results
 	cb := &captureCallback{}
 	svc := NewResultsService(resultRepo, &mockResultsUploader{}, cb, slog.Default(), time.Now, time.UTC)
 
@@ -84,12 +76,8 @@ func TestBatchSubmitFiresCallbackPerItem(t *testing.T) {
 }
 
 func TestNackTerminalFiresCallback(t *testing.T) {
-	mr, _ := miniredis.Run()
-	defer mr.Close()
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	defer rdb.Close()
-
-	taskRepo := repository.NewTaskRepository(rdb, time.UTC, "exp_full_jitter", 1, 10, nil)
+	stores := openPebbleStores(t)
+	taskRepo := stores.tasks
 	mockSubRepo := &mockSubscriptionRepo{}
 	notifier := NewNotifierService(mockSubRepo, nil, "test-secret", 5, nil, ratelimit.Bucket{}, nil)
 	cb := &captureCallback{}
@@ -130,12 +118,8 @@ func TestNackTerminalFiresCallback(t *testing.T) {
 }
 
 func TestNackNonTerminalDoesNotFireCallback(t *testing.T) {
-	mr, _ := miniredis.Run()
-	defer mr.Close()
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	defer rdb.Close()
-
-	taskRepo := repository.NewTaskRepository(rdb, time.UTC, "exp_full_jitter", 1, 10, nil)
+	stores := openPebbleStores(t)
+	taskRepo := stores.tasks
 	mockSubRepo := &mockSubscriptionRepo{}
 	notifier := NewNotifierService(mockSubRepo, nil, "test-secret", 5, nil, ratelimit.Bucket{}, nil)
 	cb := &captureCallback{}

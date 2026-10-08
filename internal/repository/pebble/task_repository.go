@@ -313,6 +313,9 @@ func (r *TaskRepository) EnqueueWithID(ctx context.Context, id string, cmd domai
 		r.NoteDelayed(cmd, tenantID)
 	}
 	metrics.TaskCreatedTotal.WithLabelValues(string(cmd)).Inc()
+	if !delayed {
+		metrics.QueueDepth.WithLabelValues(string(cmd), "ready").Inc()
+	}
 	return task, ready, nil
 }
 
@@ -636,6 +639,7 @@ func (r *TaskRepository) completeClaim(ctx context.Context, workerID string, cmd
 		return nil, false, fmt.Errorf("commit claim: %w", err)
 	}
 	r.leases.Set(id, workerID, cmd, tenantID, leaseUntil.Unix())
+	metrics.QueueDepth.WithLabelValues(string(cmd), "ready").Dec()
 	return &t, true, nil
 }
 
@@ -784,6 +788,7 @@ collect:
 	// doesn't leave the in-memory state ahead of disk.
 	for _, t := range out {
 		r.leases.Set(t.ID, workerID, t.Command, tenantID, leaseUntilU)
+		metrics.QueueDepth.WithLabelValues(string(t.Command), "ready").Dec()
 	}
 	return out, nil
 }

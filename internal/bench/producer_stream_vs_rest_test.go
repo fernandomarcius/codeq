@@ -116,7 +116,7 @@ func TestProducerThroughput_RESTPath(t *testing.T) {
 	}
 	srv := newPebbleAppForProducer(t, "")
 
-	httpClient := &http.Client{Timeout: 10 * time.Second}
+	httpClient := benchHTTPClient()
 	payload := []byte(`{"command":"GENERATE_MASTER","payload":{"bench":true}}`)
 	var created atomic.Int64
 	stop := make(chan struct{})

@@ -15,3 +15,21 @@ spec:
   storageClassName: {{ .Values.persistence.artifacts.storageClass }}
   {{- end }}
 {{- end }}
+{{- if .Values.persistence.pebble.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "codeq.fullname" . }}-pebble
+  labels:
+{{ include "codeq.labels" . | indent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.persistence.pebble.size }}
+  {{- if .Values.persistence.pebble.storageClass }}
+  storageClassName: {{ .Values.persistence.pebble.storageClass }}
+  {{- end }}
+{{- end }}

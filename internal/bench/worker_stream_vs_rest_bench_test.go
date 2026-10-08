@@ -133,7 +133,7 @@ func newPebbleAppForBench(tb testing.TB, streamAddr string) *httptest.Server {
 func runProducer(t *testing.T, ctx context.Context, baseURL string, initial int) (created *atomic.Int64) {
 	t.Helper()
 	created = &atomic.Int64{}
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := benchHTTPClient()
 	payload := []byte(`{"command":"GENERATE_MASTER","payload":{"bench":true}}`)
 
 	post := func() error {
@@ -200,7 +200,7 @@ func TestThroughput_RESTPath(t *testing.T) {
 	created := runProducer(t, prodCtx, srv.URL, 5000)
 	defer prodCancel()
 
-	httpClient := &http.Client{Timeout: 10 * time.Second}
+	httpClient := benchHTTPClient()
 	var completed atomic.Int64
 	stop := make(chan struct{})
 

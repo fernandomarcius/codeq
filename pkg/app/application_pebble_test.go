@@ -46,10 +46,8 @@ func TestNewApplication_Pebble(t *testing.T) {
 		WorkerAuthConfig:                   json.RawMessage(`{"token":"dev-token","subject":"worker-dev","scopes":["codeq:claim","codeq:heartbeat","codeq:abandon","codeq:nack","codeq:result","codeq:subscribe"],"eventTypes":["*"],"raw":{"tenantId":"dev-tenant"}}`),
 		PersistenceProvider:                "pebble",
 		PersistenceConfig:                  pcfg,
-		// RedisAddr stays unset; the Pebble path still constructs a
-		// redis client for ratelimit but we keep the call no-op-friendly
-		// by leaving the in-memory path enabled (ratelimit treats zero
-		// rate as disabled).
+		// RedisAddr is ignored. Persistence is Pebble and rate limits
+		// are enforced by the in-process limiter.
 		RedisAddr: "127.0.0.1:0",
 	}
 	if err := cfg.Validate(); err != nil {

@@ -3,27 +3,13 @@ package services
 import (
 	"context"
 	"testing"
-	"time"
 
-	"github.com/osvaldoandrade/codeq/internal/repository"
 	"github.com/osvaldoandrade/codeq/pkg/domain"
-
-	"github.com/alicebob/miniredis/v2"
-	"github.com/go-redis/redis/v8"
 )
 
 func setupSubscriptionServiceTest(t *testing.T) (context.Context, SubscriptionService) {
 	t.Helper()
-	mr, err := miniredis.Run()
-	if err != nil {
-		t.Fatalf("miniredis start: %v", err)
-	}
-	t.Cleanup(mr.Close)
-
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	t.Cleanup(func() { _ = rdb.Close() })
-
-	repo := repository.NewSubscriptionRepository(rdb, time.UTC)
+	repo := openPebbleStores(t).subs
 	svc := NewSubscriptionService(repo)
 
 	return context.Background(), svc

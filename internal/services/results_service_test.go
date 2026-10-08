@@ -6,11 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/osvaldoandrade/codeq/internal/repository"
 	"github.com/osvaldoandrade/codeq/pkg/domain"
-
-	"github.com/alicebob/miniredis/v2"
-	"github.com/go-redis/redis/v8"
 )
 
 // mockUploader for testing
@@ -34,13 +30,7 @@ func (e *mockResultsError) Error() string {
 }
 
 func TestNewResultsService(t *testing.T) {
-	mr, _ := miniredis.Run()
-	defer mr.Close()
-
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	defer rdb.Close()
-
-	repo := repository.NewResultRepository(rdb, time.UTC, nil)
+	repo := openPebbleStores(t).results
 	uploader := &mockResultsUploader{}
 	logger := slog.Default()
 	now := func() time.Time { return time.Now() }
@@ -52,13 +42,7 @@ func TestNewResultsService(t *testing.T) {
 }
 
 func TestResultsServiceGetTaskNotFound(t *testing.T) {
-	mr, _ := miniredis.Run()
-	defer mr.Close()
-
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	defer rdb.Close()
-
-	repo := repository.NewResultRepository(rdb, time.UTC, nil)
+	repo := openPebbleStores(t).results
 	uploader := &mockResultsUploader{}
 	logger := slog.Default()
 	now := func() time.Time { return time.Now() }
@@ -75,17 +59,11 @@ func TestResultsServiceGetTaskNotFound(t *testing.T) {
 }
 
 func TestResultsServiceGetResultNotFound(t *testing.T) {
-	mr, _ := miniredis.Run()
-	defer mr.Close()
-
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	defer rdb.Close()
-
-	// Create a task but no result
-	taskRepo := repository.NewTaskRepository(rdb, time.UTC, "exp_full_jitter", 1, 10, nil)
+	stores := openPebbleStores(t)
+	taskRepo := stores.tasks
 	task, _ := taskRepo.Enqueue(context.Background(), domain.CmdGenerateMaster, `{"test":"data"}`, 0, "", 5, "", time.Time{}, "")
 
-	repo := repository.NewResultRepository(rdb, time.UTC, nil)
+	repo := stores.results
 	uploader := &mockResultsUploader{}
 	logger := slog.Default()
 	now := func() time.Time { return time.Now() }
@@ -102,14 +80,8 @@ func TestResultsServiceGetResultNotFound(t *testing.T) {
 }
 
 func TestResultsServiceBatchSubmit(t *testing.T) {
-	mr, _ := miniredis.Run()
-	defer mr.Close()
-
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	defer rdb.Close()
-
-	// Setup task repository and create test tasks
-	taskRepo := repository.NewTaskRepository(rdb, time.UTC, "exp_full_jitter", 1, 10, nil)
+	stores := openPebbleStores(t)
+	taskRepo := stores.tasks
 
 	// Create 3 tasks
 	task1, _ := taskRepo.Enqueue(context.Background(), domain.CmdGenerateMaster, `{"test":"data1"}`, 0, "", 5, "", time.Time{}, "")
@@ -122,7 +94,7 @@ func TestResultsServiceBatchSubmit(t *testing.T) {
 	_, _, _ = taskRepo.Claim(context.Background(), "worker1", cmds, 30, 1, 5, "")
 	_, _, _ = taskRepo.Claim(context.Background(), "worker1", cmds, 30, 1, 5, "")
 
-	resultRepo := repository.NewResultRepository(rdb, time.UTC, nil)
+	resultRepo := stores.results
 	uploader := &mockResultsUploader{}
 	logger := slog.Default()
 	now := func() time.Time { return time.Now() }
@@ -181,5 +153,66 @@ func TestResultsServiceBatchSubmit(t *testing.T) {
 	task, _ := taskRepo.Get(context.Background(), task1.ID)
 	if task.Status != domain.StatusCompleted {
 		t.Errorf("Expected task1 status to be COMPLETED, got %s", task.Status)
+	}
+}
+
+func TestResultsServiceSubmit(t *testing.T) {
+	const workerID = "submit-worker"
+	stores := openPebbleStores(t)
+	ctx := context.Background()
+	_, err := stores.tasks.Enqueue(ctx, domain.CmdGenerateMaster, `{"k":"v"}`, 0, "https://example.com/hook", 5, "", time.Time{}, "tenant-a")
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	claimed, ok, err := stores.tasks.Claim(ctx, workerID, []domain.Command{domain.CmdGenerateMaster}, 30, 1, 5, "tenant-a")
+	if err != nil || !ok || claimed == nil {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+
+	svc := NewResultsService(stores.results, &mockResultsUploader{}, nil, slog.Default(), time.Now, time.UTC)
+
+	if _, err := svc.Submit(ctx, "missing", domain.SubmitResultRequest{Status: domain.StatusCompleted, Result: map[string]any{"ok": true}}); err == nil || err.Error() != "task not found" {
+		t.Fatalf("missing task: %v", err)
+	}
+
+	pending, err := stores.tasks.Enqueue(ctx, domain.CmdGenerateMaster, `{}`, 0, "", 5, "", time.Time{}, "tenant-a")
+	if err != nil {
+		t.Fatalf("enqueue pending: %v", err)
+	}
+	if _, err := svc.Submit(ctx, pending.ID, domain.SubmitResultRequest{Status: domain.StatusCompleted, Result: map[string]any{"ok": true}}); err == nil || err.Error() != "not-in-progress" {
+		t.Fatalf("pending submit: %v", err)
+	}
+	if _, err := svc.Submit(ctx, claimed.ID, domain.SubmitResultRequest{WorkerID: "other", Status: domain.StatusCompleted, Result: map[string]any{"ok": true}}); err == nil || err.Error() != "not-owner" {
+		t.Fatalf("wrong worker: %v", err)
+	}
+	if _, err := svc.Submit(ctx, claimed.ID, domain.SubmitResultRequest{WorkerID: workerID, Status: domain.StatusCompleted}); err == nil || err.Error() != "result required when status=COMPLETED" {
+		t.Fatalf("missing result: %v", err)
+	}
+	if _, err := svc.Submit(ctx, claimed.ID, domain.SubmitResultRequest{WorkerID: workerID, Status: domain.StatusFailed}); err == nil || err.Error() != "error required when status=FAILED" {
+		t.Fatalf("missing error: %v", err)
+	}
+	if _, err := svc.Submit(ctx, claimed.ID, domain.SubmitResultRequest{WorkerID: workerID, Status: "NOPE"}); err == nil || err.Error() != "invalid status" {
+		t.Fatalf("invalid status: %v", err)
+	}
+
+	rec, err := svc.Submit(ctx, claimed.ID, domain.SubmitResultRequest{
+		WorkerID: workerID,
+		Status:   domain.StatusCompleted,
+		Result:   map[string]any{"ok": true},
+		Artifacts: []domain.ArtifactIn{
+			{Name: "link", URL: "https://example.com/link"},
+			{Name: "blob", ContentBase64: "aGVsbG8=", ContentType: "text/plain"},
+			{Name: "skip"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if rec.Status != domain.StatusCompleted || len(rec.Artifacts) != 2 {
+		t.Fatalf("record status=%s artifacts=%d", rec.Status, len(rec.Artifacts))
+	}
+	got, taskAfter, err := svc.Get(ctx, claimed.ID)
+	if err != nil || got == nil || taskAfter.Status != domain.StatusCompleted {
+		t.Fatalf("get after submit: rec=%v task=%v err=%v", got, taskAfter, err)
 	}
 }

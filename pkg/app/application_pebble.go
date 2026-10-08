@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -11,7 +12,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/go-redis/redis/v8"
 
 	"net"
 
@@ -66,17 +66,6 @@ func validateClusterConfig(c config.ClusterConfig) error {
 	return nil
 }
 
-// noopLimiter is the rate-limiter the Pebble path uses: there is no
-// shared bucket across processes (Pebble is single-instance), and the
-// in-flight benchmark doesn't exercise webhook rate limiting. A real
-// deployment can replace this with an in-process token bucket without
-// touching the redis path.
-type noopLimiter struct{}
-
-func (noopLimiter) Allow(_ context.Context, _ string, _ string, _ ratelimit.Bucket) (ratelimit.Decision, error) {
-	return ratelimit.Decision{Allowed: true}, nil
-}
-
 // pebbleConfig is the shape we expect when PersistenceProvider="pebble".
 // "path" is the only required field; "fsyncOnCommit" can be flipped on for
 // the durability-first tier (defaults to no-sync for max throughput).
@@ -91,539 +80,515 @@ type pebbleConfig struct {
 	NumShards int `json:"numShards"`
 }
 
-// newPebbleApplication constructs the full Application stack against an
-// embedded Pebble DB. It mirrors the redis NewApplication shape so the
-// caller (NewApplication itself) can swap on cfg.PersistenceProvider with
-// no other downstream changes.
-//
-// redisClient is still required for ratelimit + (currently) the
-// notifier/subscription helpers that haven't been ported. They'll either
-// be migrated in a follow-up or wired against an in-process token-bucket;
-// for now we accept the dual dependency so Pebble can be enabled without
-// rewriting half the system at once.
-func newPebbleApplication(
-	cfg *config.Config,
-	redisClient *redis.Client,
-	limiter ratelimit.Limiter,
-	loc *time.Location,
-	logger *slog.Logger,
-	webhookClient *http.Client,
-	tracingShutdown func(context.Context) error,
-	shardSupplier domain.ShardSupplier,
-	opts ...ApplicationOption,
-) (*Application, error) {
-	// Initialize anything the dispatch site couldn't pre-build for us; the
-	// Pebble path is reachable both from NewApplication (where everything
-	// would already be set) and directly in tests (everything nil).
-	if loc == nil {
-		l, err := time.LoadLocation(cfg.Timezone)
-		if err != nil || l == nil {
-			l = time.UTC
-		}
-		loc = l
-	}
-	if logger == nil {
-		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	}
-	if webhookClient == nil {
-		webhookClient = &http.Client{Transport: http.DefaultTransport, Timeout: 15 * time.Second}
-	}
+// pebbleRuntime is the composition root for one process. Each method
+// owns one setup step so no function carries the whole startup graph.
+type pebbleRuntime struct {
+	cfg          *config.Config
+	pc           pebbleConfig
+	loc          *time.Location
+	logger       *slog.Logger
+	webhook      *http.Client
+	opts         []ApplicationOption
+	dbs          []*pebblerepo.DB
+	raftNodes    []*raftpkg.DB
+	mux          *raftpkg.MuxAcceptor
+	bgCtx        context.Context
+	bgCancel     context.CancelFunc
+	taskShards   []*pebblerepo.TaskRepository
+	resultShards []*pebblerepo.ResultRepository
+	taskRepo     repository.TaskRepository
+	resultRepo   repository.ResultRepository
+	subRepo      repository.SubscriptionRepository
+	subs         services.SubscriptionService
+	grpcSrv      *grpc.Server
+	grpcLis      net.Listener
+	pool         *cluster.ClientPool
+	limiter      *ratelimit.InMemoryLimiter
+}
 
+// newPebbleApplication constructs the Application stack on embedded Pebble.
+// Rate limiting is process-local (one bucket map per process).
+func newPebbleApplication(cfg *config.Config, opts ...ApplicationOption) (*Application, error) {
+	rt := &pebbleRuntime{
+		cfg:     cfg,
+		loc:     locationOrUTC(cfg.Timezone),
+		logger:  slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		webhook: &http.Client{Timeout: 15 * time.Second},
+		opts:    opts,
+	}
+	pc, err := parsePebbleConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	rt.pc = pc
+	rt.dbs, err = openPebbleShards(pc)
+	if err != nil {
+		return nil, err
+	}
+	rt.bgCtx, rt.bgCancel = context.WithCancel(context.Background())
+	if err = rt.openRaft(); err != nil {
+		rt.closeAfterFailure()
+		return nil, err
+	}
+	if err = rt.routeRepositories(); err != nil {
+		rt.closeAfterFailure()
+		return nil, err
+	}
+	return rt.finish()
+}
+
+func locationOrUTC(name string) *time.Location {
+	loc, err := time.LoadLocation(name)
+	if err != nil || loc == nil {
+		return time.UTC
+	}
+	return loc
+}
+
+func parsePebbleConfig(cfg *config.Config) (pebbleConfig, error) {
 	var pc pebbleConfig
 	if len(cfg.PersistenceConfig) > 0 {
 		if err := json.Unmarshal(cfg.PersistenceConfig, &pc); err != nil {
-			return nil, fmt.Errorf("parse pebble PersistenceConfig: %w", err)
+			return pebbleConfig{}, fmt.Errorf("parse pebble PersistenceConfig: %w", err)
 		}
 	}
 	if pc.Path == "" {
 		pc.Path = "./codeq-pebble"
 	}
 	if err := os.MkdirAll(pc.Path, 0o700); err != nil {
-		return nil, fmt.Errorf("ensure pebble dir %s: %w", pc.Path, err)
+		return pebbleConfig{}, fmt.Errorf("ensure pebble dir %s: %w", pc.Path, err)
 	}
+	if pc.NumShards <= 0 {
+		pc.NumShards = 1
+	}
+	return pc, nil
+}
 
-	// Phase 8: shard the Pebble write side per-shard so commit pipelines
-	// + compaction run in parallel within a single process. NumShards=0
-	// or 1 keeps the historical single-DB layout (and skips the subdir
-	// indirection). N>1 opens Path/shard<i>/ for each shard.
-	numShards := pc.NumShards
-	if numShards <= 0 {
-		numShards = 1
-	}
-	dbs := make([]*pebblerepo.DB, 0, numShards)
-	openShard := func(idx int) error {
-		shardPath := pc.Path
-		if numShards > 1 {
-			shardPath = fmt.Sprintf("%s/shard%d", pc.Path, idx)
-			if err := os.MkdirAll(shardPath, 0o700); err != nil {
-				return fmt.Errorf("ensure pebble shard dir %s: %w", shardPath, err)
-			}
-		}
-		shardDB, err := pebblerepo.Open(pebblerepo.Options{Path: shardPath, FsyncOnCommit: pc.FsyncOnCommit})
+func openPebbleShards(pc pebbleConfig) ([]*pebblerepo.DB, error) {
+	dbs := make([]*pebblerepo.DB, 0, pc.NumShards)
+	for i := range pc.NumShards {
+		db, err := openOnePebbleShard(pc, i)
 		if err != nil {
-			return fmt.Errorf("open pebble shard %d: %w", idx, err)
+			closePebbleDBs(dbs)
+			return nil, err
 		}
-		dbs = append(dbs, shardDB)
+		dbs = append(dbs, db)
+	}
+	return dbs, nil
+}
+
+func openOnePebbleShard(pc pebbleConfig, idx int) (*pebblerepo.DB, error) {
+	shardPath := pc.Path
+	if pc.NumShards > 1 {
+		shardPath = fmt.Sprintf("%s/shard%d", pc.Path, idx)
+		if err := os.MkdirAll(shardPath, 0o700); err != nil {
+			return nil, fmt.Errorf("ensure pebble shard dir %s: %w", shardPath, err)
+		}
+	}
+	db, err := pebblerepo.Open(pebblerepo.Options{Path: shardPath, FsyncOnCommit: pc.FsyncOnCommit})
+	if err != nil {
+		return nil, fmt.Errorf("open pebble shard %d: %w", idx, err)
+	}
+	return db, nil
+}
+
+func closePebbleDBs(dbs []*pebblerepo.DB) {
+	for _, db := range dbs {
+		_ = db.Close()
+	}
+}
+
+func (rt *pebbleRuntime) openRaft() error {
+	rt.raftNodes = make([]*raftpkg.DB, len(rt.dbs))
+	if !rt.cfg.Raft.Enabled {
 		return nil
 	}
-	for i := range numShards {
-		if err := openShard(i); err != nil {
-			for _, d := range dbs {
-				_ = d.Close()
-			}
-			return nil, err
-		}
+	mux, err := openMuxAcceptor(rt.cfg)
+	if err != nil {
+		return err
 	}
-	// db remains as the first shard for any code path that still expects
-	// a single *DB (cluster.Server, subscription repo). Subscription
-	// data stays unsharded for now; it's never the bottleneck.
-	db := dbs[0]
-
-	// background goroutines (reaper, gossiper, subscription cleanup) share a
-	// cancellable context that the Application's shutdown hook cancels
-	// BEFORE closing the Pebble DB — otherwise the reaper wakes on its
-	// next tick against a closed DB and panics.
-	bgCtx, bgCancel := context.WithCancel(context.Background())
-
-	// Raft replication (M1 single-shard + M2 multi-shard). When
-	// cfg.Raft.Enabled, wire one raft group per Pebble shard. Each
-	// group has its own LogStore/StableStore/SnapshotStore over the
-	// shard's Pebble (different prefixes), its own listening socket
-	// (BindAddr+shardIdx), and its own FSM. Cross-shard writes already
-	// fan out via ShardedTaskRepository — the per-shard raft groups
-	// keep each fan-out arm independently replicated.
-	//
-	// raftNodes[i] is the raft group for dbs[i]. They share the same
-	// lifecycle as the shard's Pebble (raft.Close must run BEFORE
-	// pebble.Close — see TracingShutdown and cleanupStartupFailure).
-	raftNodes := make([]*raftpkg.DB, len(dbs))
-	var muxAcceptor *raftpkg.MuxAcceptor
-	if cfg.Raft.Enabled {
-		// Mux mode: open one TCP listener at BindAddr and demux by
-		// group ID. Every shard's raft group uses the same port.
-		// Non-mux mode keeps the M1/M2 per-shard +offset behavior.
-		if cfg.Raft.MuxEnabled {
-			acc, err := raftpkg.NewMuxAcceptor(cfg.Raft.BindAddr, os.Stderr)
-			if err != nil {
-				bgCancel()
-				for _, d := range dbs {
-					_ = d.Close()
-				}
-				return nil, fmt.Errorf("raft mux acceptor: %w", err)
-			}
-			muxAcceptor = acc
-		}
-		for i, shardDB := range dbs {
-			var (
-				shardBind  string
-				shardPeers map[string]string
-			)
-			shardPath := pc.Path
-			if numShards > 1 {
-				shardPath = fmt.Sprintf("%s/shard%d", pc.Path, i)
-			}
-			raftCfg := raftpkg.Config{
-				Path:          shardPath,
-				SelfID:        cfg.Raft.SelfID,
-				Bootstrap:     cfg.Raft.Bootstrap,
-				PeerHTTPAddrs: cfg.Raft.PeerHTTPAddrs,
-				HeartbeatMS:   cfg.Raft.HeartbeatMS,
-				ElectionMS:    cfg.Raft.ElectionMS,
-				LeaderLeaseMS: cfg.Raft.LeaderLeaseMS,
-				CommitMS:      cfg.Raft.CommitMS,
-			}
-			if muxAcceptor != nil {
-				sl, err := muxAcceptor.RegisterGroup(uint32(i))
-				if err != nil {
-					_ = muxAcceptor.Close()
-					bgCancel()
-					for _, d := range dbs {
-						_ = d.Close()
-					}
-					return nil, fmt.Errorf("raft mux register shard %d: %w", i, err)
-				}
-				// In mux mode every shard binds the SAME port (the
-				// acceptor's). Peers come through unchanged.
-				shardBind = muxAcceptor.Addr().String()
-				shardPeers = cfg.Raft.Peers
-				raftCfg.StreamLayer = sl
-			} else {
-				addr, err := bindAddrForShard(cfg.Raft.BindAddr, i)
-				if err != nil {
-					bgCancel()
-					for _, d := range dbs {
-						_ = d.Close()
-					}
-					return nil, fmt.Errorf("raft bind addr shard %d: %w", i, err)
-				}
-				peers, err := peersForShard(cfg.Raft.Peers, i)
-				if err != nil {
-					bgCancel()
-					for _, d := range dbs {
-						_ = d.Close()
-					}
-					return nil, fmt.Errorf("raft peers shard %d: %w", i, err)
-				}
-				shardBind = addr
-				shardPeers = peers
-			}
-			raftCfg.BindAddr = shardBind
-			raftCfg.PeerAddrs = shardPeers
-			if cfg.Raft.ApplyTimeoutSeconds > 0 {
-				raftCfg.ApplyTimeout = time.Duration(cfg.Raft.ApplyTimeoutSeconds) * time.Second
-			}
-			rdb, err := raftpkg.OpenWithPebble(bgCtx, raftCfg, shardDB.Raw())
-			if err != nil {
-				bgCancel()
-				if muxAcceptor != nil {
-					_ = muxAcceptor.Close()
-				}
-				// Close any raft nodes already opened (lifecycle:
-				// raft.Close before pebble.Close).
-				for _, r := range raftNodes[:i] {
-					if r != nil {
-						_ = r.Close()
-					}
-				}
-				for _, d := range dbs {
-					_ = d.Close()
-				}
-				return nil, fmt.Errorf("raft open shard %d: %w", i, err)
-			}
-			shardDB.AttachReplicator(rdb)
-			raftNodes[i] = rdb
-		}
-		logger.Info("raft replication enabled",
-			"selfID", cfg.Raft.SelfID,
-			"baseBindAddr", cfg.Raft.BindAddr,
-			"peers", len(cfg.Raft.Peers),
-			"shards", len(dbs))
-	}
-
-	taskShards := make([]*pebblerepo.TaskRepository, len(dbs))
-	resultShards := make([]*pebblerepo.ResultRepository, len(dbs))
-	for i, d := range dbs {
-		taskShards[i] = pebblerepo.NewTaskRepository(d, loc, cfg.BackoffPolicy, cfg.BackoffBaseSeconds, cfg.BackoffMaxSeconds)
-		resultShards[i] = pebblerepo.NewResultRepository(d, loc)
-	}
-	localTaskRepo := taskShards[0]
-	localResultRepo := resultShards[0]
-	subRepo := pebblerepo.NewSubscriptionRepository(db, loc)
-
-	// In cluster mode, wrap the local Pebble repos with routers that:
-	//   - hash-route ID-aware operations to the owning node via gRPC
-	//   - scatter-gather Claim across every node
-	// The service layer above takes plain repository interfaces, so it
-	// doesn't observe whether it's holding the local Pebble repo or the
-	// router. The internal gRPC server delegates to the SAME local repo,
-	// so requests that hash back to this node short-circuit the network.
-	var (
-		taskRepo   repository.TaskRepository   = localTaskRepo
-		resultRepo repository.ResultRepository = localResultRepo
-		grpcSrv    *grpc.Server
-		grpcLis    net.Listener
-		clientPool *cluster.ClientPool
-	)
-	if numShards > 1 {
-		// Cluster mode + intra-process sharding is not supported in this
-		// first cut — cluster.Server expects a single concrete
-		// *TaskRepository, and a sharded wrapper would need its own
-		// cluster bridge. Single-node sharded is fine; multi-node
-		// sharded is a follow-up.
-		if cfg.Cluster.Enabled {
-			bgCancel()
-			for _, d := range dbs {
-				_ = d.Close()
-			}
-			return nil, fmt.Errorf("pebble: cluster mode + intra-process shards not supported (pick one)")
-		}
-		taskRepo = pebblerepo.NewShardedTaskRepository(taskShards)
-		resultRepo = pebblerepo.NewShardedResultRepository(resultShards)
-		logger.Info("pebble shards enabled", "shards", numShards)
-	}
-	if cfg.Cluster.Enabled {
-		if err := validateClusterConfig(cfg.Cluster); err != nil {
-			bgCancel()
-			_ = db.Close()
-			return nil, err
-		}
-		nodes := make([]cluster.Node, 0, len(cfg.Cluster.Nodes))
-		for _, n := range cfg.Cluster.Nodes {
-			nodes = append(nodes, cluster.Node{ID: n.ID, GRPCAddr: n.GRPCAddr})
-		}
-		ring := cluster.NewLocalRing(cluster.NewRing(nodes), cfg.Cluster.SelfID)
-		clientPool = cluster.NewClientPool()
-
-		// Bloom of locally-stored task IDs; gossiped to peers so they can
-		// short-circuit ID-routed lookups for ids that definitely aren't
-		// on this node. 1M expected items at 0.1% FP rate sizes the
-		// filter at ~1.7 MiB — cheap to ship across the wire on the 1s
-		// gossip cadence.
-		localBloom := cluster.NewBloom(1_000_000, 0.001)
-		bloomCache := cluster.NewBloomCache(1_000_000, 0.001)
-
-		// Start the internal gRPC server. Local repos serve every RPC;
-		// the router on this node will short-circuit calls that hash to
-		// SelfID and only talk gRPC for peers.
-		var err error
-		grpcLis, err = net.Listen("tcp", cfg.Cluster.GRPCAddr)
+	rt.mux = mux
+	for i, shardDB := range rt.dbs {
+		rdb, err := openRaftShard(rt.bgCtx, rt.cfg, rt.pc, mux, i, shardDB)
 		if err != nil {
-			bgCancel()
-			_ = db.Close()
-			return nil, fmt.Errorf("cluster gRPC listen %s: %w", cfg.Cluster.GRPCAddr, err)
+			return err
 		}
-		grpcSrv = grpc.NewServer()
-		clusterpb.RegisterTaskNodeServer(grpcSrv, &cluster.Server{
-			NodeID:     cfg.Cluster.SelfID,
-			Tasks:      localTaskRepo,
-			Results:    localResultRepo,
-			LocalBloom: localBloom,
-		})
-		go func() {
-			if err := grpcSrv.Serve(grpcLis); err != nil && err != grpc.ErrServerStopped {
-				logger.Error("cluster gRPC server stopped", "err", err)
-			}
-		}()
-		logger.Info("cluster mode enabled",
-			"selfID", cfg.Cluster.SelfID,
-			"grpcAddr", cfg.Cluster.GRPCAddr,
-			"peers", len(nodes)-1)
-
-		taskRepo = cluster.NewTaskRouter(localTaskRepo, ring, clientPool).
-			WithBloomCache(bloomCache).
-			WithLocalBloom(localBloom)
-		resultRepo = cluster.NewResultRouter(localResultRepo, ring, clientPool).
-			WithBloomCache(bloomCache)
-
-		// Gossip peer blooms in the background. 1s default cadence; tests
-		// can force a poll via Gossiper but this is enough for production.
-		gossiper := cluster.NewGossiper(ring, clientPool, bloomCache, time.Second, logger)
-		gossiper.Start(bgCtx)
+		rt.raftNodes[i] = rdb
 	}
+	rt.logger.Info("raft replication enabled",
+		"selfID", rt.cfg.Raft.SelfID,
+		"baseBindAddr", rt.cfg.Raft.BindAddr,
+		"peers", len(rt.cfg.Raft.Peers),
+		"shards", len(rt.dbs))
+	return nil
+}
 
-	subs := services.NewSubscriptionService(subRepo)
-	notifier := services.NewNotifierService(subRepo, logger, cfg.WebhookHmacSecret, cfg.SubscriptionMinIntervalSeconds, limiter, ratelimit.Bucket(cfg.RateLimit.Webhook), webhookClient)
-	cleanup := services.NewSubscriptionCleanupService(subRepo, logger, cfg.SubscriptionCleanupIntervalSeconds)
-	resultCallback := services.NewResultCallbackService(
-		logger,
-		cfg.WebhookHmacSecret,
-		cfg.ResultWebhookMaxAttempts,
-		cfg.ResultWebhookBaseBackoffSeconds,
-		cfg.ResultWebhookMaxBackoffSeconds,
-		limiter,
-		ratelimit.Bucket(cfg.RateLimit.Webhook),
-		webhookClient,
+func openMuxAcceptor(cfg *config.Config) (*raftpkg.MuxAcceptor, error) {
+	if !cfg.Raft.MuxEnabled {
+		return nil, nil
+	}
+	acc, err := raftpkg.NewMuxAcceptor(cfg.Raft.BindAddr, os.Stderr)
+	if err != nil {
+		return nil, fmt.Errorf("raft mux acceptor: %w", err)
+	}
+	return acc, nil
+}
+
+func openRaftShard(ctx context.Context, cfg *config.Config, pc pebbleConfig, mux *raftpkg.MuxAcceptor, idx int, shardDB *pebblerepo.DB) (*raftpkg.DB, error) {
+	shardPath := pc.Path
+	if pc.NumShards > 1 {
+		shardPath = fmt.Sprintf("%s/shard%d", pc.Path, idx)
+	}
+	raftCfg := raftpkg.Config{
+		Path:          shardPath,
+		SelfID:        cfg.Raft.SelfID,
+		Bootstrap:     cfg.Raft.Bootstrap,
+		PeerHTTPAddrs: cfg.Raft.PeerHTTPAddrs,
+		HeartbeatMS:   cfg.Raft.HeartbeatMS,
+		ElectionMS:    cfg.Raft.ElectionMS,
+		LeaderLeaseMS: cfg.Raft.LeaderLeaseMS,
+		CommitMS:      cfg.Raft.CommitMS,
+	}
+	if err := applyShardTransport(cfg, mux, idx, &raftCfg); err != nil {
+		return nil, err
+	}
+	if cfg.Raft.ApplyTimeoutSeconds > 0 {
+		raftCfg.ApplyTimeout = time.Duration(cfg.Raft.ApplyTimeoutSeconds) * time.Second
+	}
+	rdb, err := raftpkg.OpenWithPebble(ctx, raftCfg, shardDB.Raw())
+	if err != nil {
+		return nil, fmt.Errorf("raft open shard %d: %w", idx, err)
+	}
+	shardDB.AttachReplicator(rdb)
+	return rdb, nil
+}
+
+func applyShardTransport(cfg *config.Config, mux *raftpkg.MuxAcceptor, idx int, raftCfg *raftpkg.Config) error {
+	if mux != nil {
+		return applyMuxShard(cfg, mux, idx, raftCfg)
+	}
+	return applyOffsetShard(cfg, idx, raftCfg)
+}
+
+func applyMuxShard(cfg *config.Config, mux *raftpkg.MuxAcceptor, idx int, raftCfg *raftpkg.Config) error {
+	// Shard index is a configured count, not an untrusted integer.
+	sl, err := mux.RegisterGroup(uint32(idx)) // #nosec G115 -- idx is a small non-negative shard number
+	if err != nil {
+		return fmt.Errorf("raft mux register shard %d: %w", idx, err)
+	}
+	raftCfg.StreamLayer = sl
+	raftCfg.BindAddr = mux.Addr().String()
+	raftCfg.PeerAddrs = cfg.Raft.Peers
+	return nil
+}
+
+func applyOffsetShard(cfg *config.Config, idx int, raftCfg *raftpkg.Config) error {
+	addr, err := bindAddrForShard(cfg.Raft.BindAddr, idx)
+	if err != nil {
+		return fmt.Errorf("raft bind addr shard %d: %w", idx, err)
+	}
+	peers, err := peersForShard(cfg.Raft.Peers, idx)
+	if err != nil {
+		return fmt.Errorf("raft peers shard %d: %w", idx, err)
+	}
+	raftCfg.BindAddr = addr
+	raftCfg.PeerAddrs = peers
+	return nil
+}
+
+func (rt *pebbleRuntime) routeRepositories() error {
+	rt.taskShards = make([]*pebblerepo.TaskRepository, len(rt.dbs))
+	rt.resultShards = make([]*pebblerepo.ResultRepository, len(rt.dbs))
+	for i, db := range rt.dbs {
+		rt.taskShards[i] = pebblerepo.NewTaskRepository(db, rt.loc, rt.cfg.BackoffPolicy, rt.cfg.BackoffBaseSeconds, rt.cfg.BackoffMaxSeconds)
+		rt.resultShards[i] = pebblerepo.NewResultRepository(db, rt.loc)
+	}
+	rt.taskRepo = rt.taskShards[0]
+	rt.resultRepo = rt.resultShards[0]
+	rt.subRepo = pebblerepo.NewSubscriptionRepository(rt.dbs[0], rt.loc)
+	if rt.pc.NumShards > 1 {
+		if rt.cfg.Cluster.Enabled {
+			return fmt.Errorf("pebble: cluster mode + intra-process shards not supported (pick one)")
+		}
+		rt.taskRepo = pebblerepo.NewShardedTaskRepository(rt.taskShards)
+		rt.resultRepo = pebblerepo.NewShardedResultRepository(rt.resultShards)
+		rt.logger.Info("pebble shards enabled", "shards", rt.pc.NumShards)
+		return nil
+	}
+	if !rt.cfg.Cluster.Enabled {
+		return nil
+	}
+	return rt.startCluster()
+}
+
+func (rt *pebbleRuntime) startCluster() error {
+	if err := validateClusterConfig(rt.cfg.Cluster); err != nil {
+		return err
+	}
+	nodes := make([]cluster.Node, 0, len(rt.cfg.Cluster.Nodes))
+	for _, n := range rt.cfg.Cluster.Nodes {
+		nodes = append(nodes, cluster.Node{ID: n.ID, GRPCAddr: n.GRPCAddr})
+	}
+	ring := cluster.NewLocalRing(cluster.NewRing(nodes), rt.cfg.Cluster.SelfID)
+	rt.pool = cluster.NewClientPool()
+	localBloom := cluster.NewBloom(1_000_000, 0.001)
+	bloomCache := cluster.NewBloomCache(1_000_000, 0.001)
+	lis, err := net.Listen("tcp", rt.cfg.Cluster.GRPCAddr)
+	if err != nil {
+		return fmt.Errorf("cluster gRPC listen %s: %w", rt.cfg.Cluster.GRPCAddr, err)
+	}
+	rt.grpcLis = lis
+	rt.grpcSrv = grpc.NewServer()
+	clusterpb.RegisterTaskNodeServer(rt.grpcSrv, &cluster.Server{
+		NodeID:     rt.cfg.Cluster.SelfID,
+		Tasks:      rt.taskShards[0],
+		Results:    rt.resultShards[0],
+		LocalBloom: localBloom,
+	})
+	go serveClusterGRPC(rt.grpcSrv, rt.grpcLis, rt.logger)
+	rt.logger.Info("cluster mode enabled",
+		"selfID", rt.cfg.Cluster.SelfID,
+		"grpcAddr", rt.cfg.Cluster.GRPCAddr,
+		"peers", len(nodes)-1)
+	rt.taskRepo = cluster.NewTaskRouter(rt.taskShards[0], ring, rt.pool).
+		WithBloomCache(bloomCache).
+		WithLocalBloom(localBloom)
+	rt.resultRepo = cluster.NewResultRouter(rt.resultShards[0], ring, rt.pool).
+		WithBloomCache(bloomCache)
+	cluster.NewGossiper(ring, rt.pool, bloomCache, time.Second, rt.logger).Start(rt.bgCtx)
+	return nil
+}
+
+func serveClusterGRPC(srv *grpc.Server, lis net.Listener, logger *slog.Logger) {
+	if err := srv.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+		logger.Error("cluster gRPC server stopped", "err", err)
+	}
+}
+
+func (rt *pebbleRuntime) finish() (*Application, error) {
+	rt.limiter = ratelimit.NewInMemoryLimiter()
+	notifier, cleanup, callback := rt.notificationServices()
+	rt.startReapers(callback)
+	scheduler := services.NewSchedulerService(
+		rt.taskRepo, notifier, callback, rt.loc, time.Now,
+		rt.cfg.DefaultLeaseSeconds, rt.cfg.RequeueInspectLimit, rt.cfg.MaxAttemptsDefault,
+		rt.cfg.BackoffPolicy, rt.cfg.BackoffBaseSeconds, rt.cfg.BackoffMaxSeconds,
 	)
+	results := services.NewResultsService(
+		rt.resultRepo, providers.NewLocalUploader(rt.cfg.LocalArtifactsDir), callback, rt.logger, time.Now, rt.loc,
+	)
+	go cleanup.Start(rt.bgCtx)
+	app := rt.newApplication(rt.httpEngine(), scheduler, results)
+	if err := rt.applyOptions(app); err != nil {
+		return nil, err
+	}
+	if err := rt.installValidators(app); err != nil {
+		return nil, err
+	}
+	return rt.openStreams(app, scheduler, results)
+}
 
-	// Background reaper: enforces lease expiry + TTL cleanup, which Redis
-	// gives us via key TTL. Phase 8: one reaper per Pebble shard so the
-	// sweeps run in parallel and the per-shard commit pipelines stay
-	// independent. In raft mode, LeaderGate keeps followers out of the
-	// sweep — only the leader writes through raft.Apply.
-	reaperOpts := pebblerepo.ReaperOptions{
-		BackoffPolicy:      cfg.BackoffPolicy,
-		BackoffBaseSeconds: cfg.BackoffBaseSeconds,
-		BackoffMaxSeconds:  cfg.BackoffMaxSeconds,
-		MaxAttemptsDefault: cfg.MaxAttemptsDefault,
-		DLQCallback: func(ctx context.Context, t domain.Task, rec domain.ResultRecord) {
-			if resultCallback != nil {
-				resultCallback.Send(ctx, t, rec)
+func (rt *pebbleRuntime) notificationServices() (services.NotifierService, services.SubscriptionCleanupService, services.ResultCallbackService) {
+	rt.subs = services.NewSubscriptionService(rt.subRepo)
+	bucket := ratelimit.Bucket(rt.cfg.RateLimit.Webhook)
+	notifier := services.NewNotifierService(rt.subRepo, rt.logger, rt.cfg.WebhookHmacSecret, rt.cfg.SubscriptionMinIntervalSeconds, rt.limiter, bucket, rt.webhook)
+	cleanup := services.NewSubscriptionCleanupService(rt.subRepo, rt.logger, rt.cfg.SubscriptionCleanupIntervalSeconds)
+	callback := services.NewResultCallbackService(
+		rt.logger, rt.cfg.WebhookHmacSecret, rt.cfg.ResultWebhookMaxAttempts,
+		rt.cfg.ResultWebhookBaseBackoffSeconds, rt.cfg.ResultWebhookMaxBackoffSeconds,
+		rt.limiter, bucket, rt.webhook,
+	)
+	return notifier, cleanup, callback
+}
+
+func (rt *pebbleRuntime) startReapers(callback services.ResultCallbackService) {
+	opts := pebblerepo.ReaperOptions{
+		BackoffPolicy:      rt.cfg.BackoffPolicy,
+		BackoffBaseSeconds: rt.cfg.BackoffBaseSeconds,
+		BackoffMaxSeconds:  rt.cfg.BackoffMaxSeconds,
+		MaxAttemptsDefault: rt.cfg.MaxAttemptsDefault,
+		DLQCallback: func(ctx context.Context, task domain.Task, rec domain.ResultRecord) {
+			if callback != nil {
+				callback.Send(ctx, task, rec)
 			}
 		},
 	}
-	// Each shard's reaper checks its own raft group's leadership. M1's
-	// single-shard path still works (raftNodes[0].IsLeader). M2's
-	// multi-shard path uses the per-shard raft instance so a node that
-	// leads shard 0 but follows shard 1 only sweeps shard 0.
-	for i, shardDB := range dbs {
-		opts := reaperOpts // value copy keeps DLQCallback shared
-		repo := taskShards[i]
-		opts.OnDelayed = repo.NoteDelayed
-		if cfg.Raft.Enabled && raftNodes[i] != nil {
-			ref := raftNodes[i]
-			opts.LeaderGate = ref.IsLeader
+	for i, shardDB := range rt.dbs {
+		shardOpts := opts
+		repo := rt.taskShards[i]
+		shardOpts.OnDelayed = repo.NoteDelayed
+		if rt.cfg.Raft.Enabled && rt.raftNodes[i] != nil {
+			ref := rt.raftNodes[i]
+			shardOpts.LeaderGate = ref.IsLeader
 		}
-		pebblerepo.NewReaper(shardDB, loc, logger, opts).Start(bgCtx)
+		pebblerepo.NewReaper(shardDB, rt.loc, rt.logger, shardOpts).Start(rt.bgCtx)
 	}
+}
 
-	scheduler := services.NewSchedulerService(
-		taskRepo,
-		notifier,
-		resultCallback,
-		loc,
-		time.Now,
-		cfg.DefaultLeaseSeconds,
-		cfg.RequeueInspectLimit,
-		cfg.MaxAttemptsDefault,
-		cfg.BackoffPolicy,
-		cfg.BackoffBaseSeconds,
-		cfg.BackoffMaxSeconds,
-	)
-
-	// Result service & uploader mirror the redis path verbatim.
-	uploader := providers.NewLocalUploader(cfg.LocalArtifactsDir)
-	results := services.NewResultsService(resultRepo, uploader, resultCallback, logger, time.Now, loc)
-
+func (rt *pebbleRuntime) httpEngine() *gin.Engine {
 	engine := gin.New()
 	engine.Use(gin.Recovery(), middleware.RequestIDMiddleware())
-	if cfg.TracingEnabled {
-		engine.Use(middleware.TracingMiddleware(cfg.TracingServiceName))
+	if rt.cfg.TracingEnabled {
+		engine.Use(middleware.TracingMiddleware(rt.cfg.TracingServiceName))
 	}
-	engine.Use(middleware.LoggerMiddleware(logger))
+	engine.Use(middleware.LoggerMiddleware(rt.logger))
+	return engine
+}
 
-	// Subscription cleanup goroutine — same cadence as the redis path.
-	go cleanup.Start(bgCtx)
-
-	topicService := topicsapp.NewService(topicpebble.NewTopicStore(db), time.Now)
-	if cfg.Raft.Enabled && strings.TrimSpace(cfg.Raft.TopicCatalogProtocol) != "v1" {
+func (rt *pebbleRuntime) newApplication(engine *gin.Engine, scheduler services.SchedulerService, results services.ResultsService) *Application {
+	topicService := topicsapp.NewService(topicpebble.NewTopicStore(rt.dbs[0]), time.Now)
+	if rt.cfg.Raft.Enabled && strings.TrimSpace(rt.cfg.Raft.TopicCatalogProtocol) != "v1" {
 		topicService = topicsapp.NewUnavailableService(
 			"raft.topicCatalogProtocol=v1 is required for replicated topic catalog writes",
 		)
 	}
-
 	app := &Application{
-		Config:      cfg,
+		Config:      rt.cfg,
 		Engine:      engine,
 		Scheduler:   scheduler,
 		Results:     results,
-		Subs:        subs,
+		Subs:        rt.subs,
 		Topics:      topicService,
-		Logger:      logger,
-		TZ:          loc,
-		RateLimiter: limiter,
+		Logger:      rt.logger,
+		TZ:          rt.loc,
+		RateLimiter: rt.limiter,
 	}
-	if cfg.Raft.Enabled {
-		app.RaftGroups = make([]RaftGroupStatus, 0, len(raftNodes))
-		for _, r := range raftNodes {
-			if r != nil {
-				app.RaftGroups = append(app.RaftGroups, r)
-			}
-		}
-		// One leadership source per Pebble shard, i.e. per Raft group.
-		// RAFT_MUX_ENABLED only shares the transport port; it does not
-		// change the group set.
-		groups := make([]leaderforward.Leadership, len(dbs))
-		for i, d := range dbs {
-			groups[i] = d
-		}
-		app.LeaderForward = leaderforward.New(leaderforward.Config{
-			PeerHTTPAddrs: cfg.Raft.PeerHTTPAddrs,
-			SelfID:        cfg.Raft.SelfID,
-			Groups:        groups,
-			Logger:        logger,
-		})
-	}
+	rt.attachRaft(app)
+	return app
+}
 
-	cleanupStartupFailure := func() {
-		bgCancel()
-		if grpcSrv != nil {
-			grpcSrv.Stop()
-		}
-		if grpcLis != nil {
-			_ = grpcLis.Close()
-		}
-		if clientPool != nil {
-			_ = clientPool.Close()
-		}
-		// Close raft BEFORE pebble. Raft's apply pipeline holds the
-		// pebble handle (FSM) and panics on closed-DB writes.
-		for _, r := range raftNodes {
-			if r == nil {
-				continue
-			}
-			if cerr := r.Close(); cerr != nil {
-				logger.Warn("raft close after startup failure", "err", cerr)
-			}
-		}
-		if muxAcceptor != nil {
-			_ = muxAcceptor.Close()
-		}
-		for _, d := range dbs {
-			if cerr := d.Close(); cerr != nil {
-				logger.Warn("pebble close after startup failure", "err", cerr)
-			}
+func (rt *pebbleRuntime) attachRaft(app *Application) {
+	if !rt.cfg.Raft.Enabled {
+		return
+	}
+	app.RaftGroups = make([]RaftGroupStatus, 0, len(rt.raftNodes))
+	for _, node := range rt.raftNodes {
+		if node != nil {
+			app.RaftGroups = append(app.RaftGroups, node)
 		}
 	}
+	groups := make([]leaderforward.Leadership, len(rt.dbs))
+	for i, db := range rt.dbs {
+		groups[i] = db
+	}
+	app.LeaderForward = leaderforward.New(leaderforward.Config{
+		PeerHTTPAddrs: rt.cfg.Raft.PeerHTTPAddrs,
+		SelfID:        rt.cfg.Raft.SelfID,
+		Groups:        groups,
+		Logger:        rt.logger,
+	})
+}
 
-	for _, o := range opts {
-		if err := o(app); err != nil {
-			cleanupStartupFailure()
-			return nil, err
+func (rt *pebbleRuntime) applyOptions(app *Application) error {
+	for _, opt := range rt.opts {
+		if err := opt(app); err != nil {
+			rt.closeAfterFailure()
+			return err
 		}
 	}
-	if app.ProducerValidator == nil && cfg.ProducerAuthProvider != "" {
-		v, err := auth.NewValidator(auth.ProviderConfig{Type: cfg.ProducerAuthProvider, Config: cfg.ProducerAuthConfig})
+	return nil
+}
+
+func (rt *pebbleRuntime) installValidators(app *Application) error {
+	if app.ProducerValidator == nil && rt.cfg.ProducerAuthProvider != "" {
+		v, err := auth.NewValidator(auth.ProviderConfig{Type: rt.cfg.ProducerAuthProvider, Config: rt.cfg.ProducerAuthConfig})
 		if err != nil {
-			cleanupStartupFailure()
-			return nil, err
+			rt.closeAfterFailure()
+			return err
 		}
 		app.ProducerValidator = v
 	}
-	if app.WorkerValidator == nil && cfg.WorkerAuthProvider != "" {
-		v, err := auth.NewValidator(auth.ProviderConfig{Type: cfg.WorkerAuthProvider, Config: cfg.WorkerAuthConfig})
+	if app.WorkerValidator == nil && rt.cfg.WorkerAuthProvider != "" {
+		v, err := auth.NewValidator(auth.ProviderConfig{Type: rt.cfg.WorkerAuthProvider, Config: rt.cfg.WorkerAuthConfig})
 		if err != nil {
-			cleanupStartupFailure()
-			return nil, err
+			rt.closeAfterFailure()
+			return err
 		}
 		app.WorkerValidator = v
 	}
+	return nil
+}
 
-	workerStream, err := startWorkerStreamServer(
-		cfg,
-		scheduler,
-		results,
-		app.WorkerValidator,
-		app.ProducerValidator,
-		logger,
-	)
+func (rt *pebbleRuntime) openStreams(app *Application, scheduler services.SchedulerService, results services.ResultsService) (*Application, error) {
+	workerStream, err := startWorkerStreamServer(rt.cfg, scheduler, results, app.WorkerValidator, app.ProducerValidator, rt.logger)
 	if err != nil {
-		cleanupStartupFailure()
+		rt.closeAfterFailure()
 		return nil, err
 	}
-
-	producerStream, err := startProducerStreamServer(
-		cfg,
-		scheduler,
-		app.ProducerValidator,
-		logger,
-	)
+	producerStream, err := startProducerStreamServer(rt.cfg, scheduler, app.ProducerValidator, rt.logger)
 	if err != nil {
 		stopGRPCServer(context.Background(), workerStream)
-		cleanupStartupFailure()
+		rt.closeAfterFailure()
 		return nil, err
 	}
-
 	app.TracingShutdown = func(ctx context.Context) error {
-		bgCancel()
-		stopGRPCServer(ctx, &grpcServerHandle{srv: grpcSrv, lis: grpcLis})
-		stopGRPCServer(ctx, workerStream)
-		stopGRPCServer(ctx, producerStream)
-		if clientPool != nil {
-			_ = clientPool.Close()
-		}
-		for _, r := range raftNodes {
-			if r == nil {
-				continue
-			}
-			if err := r.Close(); err != nil {
-				logger.Warn("raft close", "err", err)
-			}
-		}
-		if muxAcceptor != nil {
-			if err := muxAcceptor.Close(); err != nil {
-				logger.Warn("mux acceptor close", "err", err)
-			}
-		}
-		for _, d := range dbs {
-			if err := d.Close(); err != nil {
-				logger.Warn("pebble close", "err", err)
-			}
-		}
-		if tracingShutdown == nil {
-			return nil
-		}
-		return tracingShutdown(ctx)
+		return rt.shutdown(ctx, workerStream, producerStream)
 	}
-
 	return app, nil
+}
+
+func (rt *pebbleRuntime) shutdown(ctx context.Context, worker, producer *grpcServerHandle) error {
+	_ = rt.limiter.Close()
+	rt.bgCancel()
+	stopGRPCServer(ctx, &grpcServerHandle{srv: rt.grpcSrv, lis: rt.grpcLis})
+	stopGRPCServer(ctx, worker)
+	stopGRPCServer(ctx, producer)
+	if rt.pool != nil {
+		_ = rt.pool.Close()
+	}
+	rt.closeRaft("raft close")
+	rt.closeMux("mux acceptor close")
+	rt.closeDBs("pebble close")
+	return nil
+}
+
+func (rt *pebbleRuntime) closeAfterFailure() {
+	if rt.limiter != nil {
+		_ = rt.limiter.Close()
+	}
+	if rt.bgCancel != nil {
+		rt.bgCancel()
+	}
+	if rt.grpcSrv != nil {
+		rt.grpcSrv.Stop()
+	}
+	if rt.grpcLis != nil {
+		_ = rt.grpcLis.Close()
+	}
+	if rt.pool != nil {
+		_ = rt.pool.Close()
+	}
+	rt.closeRaft("raft close after startup failure")
+	if rt.mux != nil {
+		_ = rt.mux.Close()
+	}
+	rt.closeDBs("pebble close after startup failure")
+}
+
+func (rt *pebbleRuntime) closeRaft(msg string) {
+	for _, node := range rt.raftNodes {
+		if node == nil {
+			continue
+		}
+		if err := node.Close(); err != nil {
+			rt.logger.Warn(msg, "err", err)
+		}
+	}
+}
+
+func (rt *pebbleRuntime) closeMux(msg string) {
+	if rt.mux == nil {
+		return
+	}
+	if err := rt.mux.Close(); err != nil {
+		rt.logger.Warn(msg, "err", err)
+	}
+}
+
+func (rt *pebbleRuntime) closeDBs(msg string) {
+	for _, db := range rt.dbs {
+		if err := db.Close(); err != nil {
+			rt.logger.Warn(msg, "err", err)
+		}
+	}
 }

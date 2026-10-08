@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 
 	"github.com/osvaldoandrade/codeq/pkg/app"
@@ -19,30 +18,27 @@ import (
 )
 
 const (
-	benchTenant        = "bench-tenant"
-	benchProducerToken = "bench-producer-token"
-	benchWorkerToken   = "bench-worker-token"
-	benchProducerSub   = "bench-producer"
-	benchWorkerSub     = "bench-worker"
+	benchTenant             = "bench-tenant"
+	benchProducerToken      = "bench-producer-token"
+	benchWorkerToken        = "bench-worker-token"
+	benchProducerSub        = "bench-producer"
+	benchWorkerSub          = "bench-worker"
+	benchPersistenceKey     = "path"
+	benchPersistenceBackend = "pebble"
 )
 
 func newBenchApp(b *testing.B) *app.Application {
 	b.Helper()
 	gin.SetMode(gin.ReleaseMode)
 
-	mr, err := miniredis.Run()
-	if err != nil {
-		b.Fatalf("miniredis start: %v", err)
-	}
-	b.Cleanup(mr.Close)
-
+	pcfg, _ := json.Marshal(map[string]any{benchPersistenceKey: b.TempDir()})
 	cfg := &config.Config{
 		Env:                 "dev",
 		Timezone:            "UTC",
 		LogLevel:            "error",
 		LogFormat:           "json",
-		RedisAddr:           mr.Addr(),
-		RedisPassword:       "",
+		PersistenceProvider: benchPersistenceBackend,
+		PersistenceConfig:   pcfg,
 		DefaultLeaseSeconds: 60,
 		RequeueInspectLimit: 50,
 		LocalArtifactsDir:   b.TempDir(),

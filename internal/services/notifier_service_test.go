@@ -7,21 +7,11 @@ import (
 	"time"
 
 	"github.com/osvaldoandrade/codeq/internal/ratelimit"
-	"github.com/osvaldoandrade/codeq/internal/repository"
 	"github.com/osvaldoandrade/codeq/pkg/domain"
-
-	"github.com/alicebob/miniredis/v2"
-	"github.com/go-redis/redis/v8"
 )
 
 func TestNewNotifierServiceDefaults(t *testing.T) {
-	mr, _ := miniredis.Run()
-	defer mr.Close()
-
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	defer rdb.Close()
-
-	repo := repository.NewSubscriptionRepository(rdb, time.UTC)
+	repo := openPebbleStores(t).subs
 
 	tests := []struct {
 		name      string
@@ -43,13 +33,7 @@ func TestNewNotifierServiceDefaults(t *testing.T) {
 }
 
 func TestNotifierServiceNotifyQueueReadyNoSubscriptions(t *testing.T) {
-	mr, _ := miniredis.Run()
-	defer mr.Close()
-
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	defer rdb.Close()
-
-	repo := repository.NewSubscriptionRepository(rdb, time.UTC)
+	repo := openPebbleStores(t).subs
 	svc := NewNotifierService(repo, slog.Default(), "secret", 5, nil, ratelimit.Bucket{}, nil)
 
 	// Should not panic with no subscriptions
@@ -58,13 +42,7 @@ func TestNotifierServiceNotifyQueueReadyNoSubscriptions(t *testing.T) {
 }
 
 func TestNotifierServiceNotifyQueueReadyWithSubscription(t *testing.T) {
-	mr, _ := miniredis.Run()
-	defer mr.Close()
-
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	defer rdb.Close()
-
-	repo := repository.NewSubscriptionRepository(rdb, time.UTC)
+	repo := openPebbleStores(t).subs
 	svc := NewNotifierService(repo, slog.Default(), "secret", 5, nil, ratelimit.Bucket{}, nil)
 
 	// Create a subscription

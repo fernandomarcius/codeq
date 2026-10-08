@@ -101,6 +101,17 @@ var (
 	// idempotency_conflict because the key already maps to a task the caller
 	// may not replay (another tenant, or another topic for a binding token).
 	// route is a registered route template; kind is "binding" or "token".
+	// QueueDepth counts tasks observed in a named queue. The Pebble
+	// repository updates it when a task enters the ready queue.
+	QueueDepth = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "queue_depth",
+			Help:      "Tasks observed in a queue.",
+		},
+		[]string{"command", "queue"},
+	)
+
 	IdempotencyConflictTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: namespace,
@@ -123,5 +134,6 @@ func init() {
 		BindingScopeDeniedTotal,
 		LeaderForwardTotal,
 		IdempotencyConflictTotal,
+		QueueDepth,
 	)
 }
