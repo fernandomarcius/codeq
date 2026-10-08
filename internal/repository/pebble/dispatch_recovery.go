@@ -38,47 +38,59 @@ func (r *TaskRepository) ensureLeaderDispatch(ctx context.Context) error {
 	if r.db.repl == nil {
 		return nil
 	}
-	r.dispatchMu.Lock()
 	for {
-		if err := ctx.Err(); err != nil {
-			r.dispatchMu.Unlock()
+		done, err := r.dispatchPass(ctx)
+		if done {
 			return err
 		}
-		if !r.db.repl.IsLeader() {
-			url := r.db.repl.LeaderHTTPAddr()
-			r.dispatchMu.Unlock()
-			return &NotLeaderError{LeaderURL: url}
-		}
-		epoch := r.leadershipEpoch()
-		if r.dispatchReady && r.rebuiltEpoch == epoch {
-			r.dispatchMu.Unlock()
-			return nil
-		}
-		if r.rebuilding {
-			r.dispatchCond.Wait()
-			continue
-		}
-		r.rebuilding = true
-		r.dispatchMu.Unlock()
-
-		err := r.barrier(ctx)
-
-		r.dispatchMu.Lock()
-		if err == nil && !r.db.repl.IsLeader() {
-			err = &NotLeaderError{LeaderURL: r.db.repl.LeaderHTTPAddr()}
-		}
-		if err == nil {
-			err = r.rebuildLocked()
-		}
-		if err == nil {
-			r.rebuiltEpoch = r.leadershipEpoch()
-			r.dispatchReady = true
-		}
-		r.rebuilding = false
-		r.dispatchCond.Broadcast()
-		r.dispatchMu.Unlock()
-		return err
 	}
+}
+
+// dispatchPass either finishes the leadership check or waits for the
+// goroutine already rebuilding. done is false only when the caller
+// should retry after another rebuild completes.
+func (r *TaskRepository) dispatchPass(ctx context.Context) (bool, error) {
+	r.dispatchMu.Lock()
+	if err := ctx.Err(); err != nil {
+		r.dispatchMu.Unlock()
+		return true, err
+	}
+	if !r.db.repl.IsLeader() {
+		url := r.db.repl.LeaderHTTPAddr()
+		r.dispatchMu.Unlock()
+		return true, &NotLeaderError{LeaderURL: url}
+	}
+	if r.dispatchReady && r.rebuiltEpoch == r.leadershipEpoch() {
+		r.dispatchMu.Unlock()
+		return true, nil
+	}
+	if r.rebuilding {
+		r.dispatchCond.Wait()
+		r.dispatchMu.Unlock()
+		return false, nil
+	}
+	r.rebuilding = true
+	r.dispatchMu.Unlock()
+	return true, r.completeRebuild(ctx)
+}
+
+func (r *TaskRepository) completeRebuild(ctx context.Context) error {
+	err := r.barrier(ctx)
+	r.dispatchMu.Lock()
+	defer r.dispatchMu.Unlock()
+	if err == nil && !r.db.repl.IsLeader() {
+		err = &NotLeaderError{LeaderURL: r.db.repl.LeaderHTTPAddr()}
+	}
+	if err == nil {
+		err = r.rebuildLocked()
+	}
+	if err == nil {
+		r.rebuiltEpoch = r.leadershipEpoch()
+		r.dispatchReady = true
+	}
+	r.rebuilding = false
+	r.dispatchCond.Broadcast()
+	return err
 }
 
 func (r *TaskRepository) leadershipEpoch() uint64 {
