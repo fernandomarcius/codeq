@@ -33,6 +33,10 @@ type SchedulerService interface {
 	GetTask(ctx context.Context, id string) (*domain.Task, error)
 	AdminQueues(ctx context.Context) (map[string]any, error)
 	QueueStats(ctx context.Context, cmd domain.Command, tenantID string) (*domain.QueueStats, error)
+	// ListTasks pages the tasks of one (cmd, tenant) queue state. limit 0
+	// means DefaultTaskListLimit; a limit outside 1..MaxTaskListLimit fails
+	// with domain.ErrInvalidListLimit.
+	ListTasks(ctx context.Context, cmd domain.Command, tenantID string, state domain.QueueState, limit int, cursor string) (*domain.TaskPage, error)
 
 	// Novo: limpeza administrativa por índice Z
 	CleanupExpired(ctx context.Context, limit int, before time.Time) (int, error)
@@ -278,6 +282,30 @@ func (s *schedulerService) AdminQueues(ctx context.Context) (map[string]any, err
 
 func (s *schedulerService) QueueStats(ctx context.Context, cmd domain.Command, tenantID string) (*domain.QueueStats, error) {
 	return s.repo.QueueStats(ctx, cmd, tenantID)
+}
+
+const (
+	// DefaultTaskListLimit is the page size of a task listing that sets none.
+	DefaultTaskListLimit = 100
+	// MaxTaskListLimit bounds a page: every task carries its payload.
+	MaxTaskListLimit = 500
+)
+
+// ListTasks validates the listing request and pages the repository.
+func (s *schedulerService) ListTasks(ctx context.Context, cmd domain.Command, tenantID string, state domain.QueueState, limit int, cursor string) (*domain.TaskPage, error) {
+	if strings.TrimSpace(string(cmd)) == "" {
+		return nil, errors.New("invalid command")
+	}
+	if _, err := domain.ParseQueueState(string(state)); err != nil {
+		return nil, err
+	}
+	if limit == 0 {
+		limit = DefaultTaskListLimit
+	}
+	if limit < 1 || limit > MaxTaskListLimit {
+		return nil, domain.ErrInvalidListLimit
+	}
+	return s.repo.ListTasks(ctx, cmd, tenantID, state, limit, cursor)
 }
 
 func (s *schedulerService) CleanupExpired(ctx context.Context, limit int, before time.Time) (int, error) {

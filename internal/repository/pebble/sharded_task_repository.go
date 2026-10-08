@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"hash/fnv"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -236,6 +237,19 @@ func (s *ShardedTaskRepository) QueueStats(ctx context.Context, cmd domain.Comma
 		out.DLQ += st.DLQ
 	}
 	return out, nil
+}
+
+// ListTasks pages a queue state across the shards in shard order, resuming
+// each shard from its own cursor.
+func (s *ShardedTaskRepository) ListTasks(ctx context.Context, cmd domain.Command, tenantID string, state domain.QueueState, limit int, cursor string) (*domain.TaskPage, error) {
+	partitions := make([]string, len(s.shards))
+	for i := range s.shards {
+		partitions[i] = strconv.Itoa(i)
+	}
+	return repository.ListAcrossPartitions(ctx, partitions, limit, cursor, func(ctx context.Context, partition string, limit int, cursor string) (*domain.TaskPage, error) {
+		idx, _ := strconv.Atoi(partition) // partition names come from the slice above
+		return s.shards[idx].ListTasks(ctx, cmd, tenantID, state, limit, cursor)
+	})
 }
 
 func (s *ShardedTaskRepository) CleanupExpired(ctx context.Context, limit int, before time.Time) (int, error) {

@@ -23,6 +23,9 @@ type TaskRepository interface {
 	Get(ctx context.Context, taskID string) (*domain.Task, error)
 	AdminQueues(ctx context.Context) (map[string]any, error)
 	QueueStats(ctx context.Context, cmd domain.Command, tenantID string) (*domain.QueueStats, error)
+	// ListTasks returns up to limit tasks of one (cmd, tenant) queue state,
+	// resuming after cursor (empty for the first page). See ADR 0005.
+	ListTasks(ctx context.Context, cmd domain.Command, tenantID string, state domain.QueueState, limit int, cursor string) (*domain.TaskPage, error)
 	CleanupExpired(ctx context.Context, limit int, before time.Time) (int, error)
 }
 

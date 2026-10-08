@@ -194,3 +194,60 @@ func TestRouterClaimScatterGather(t *testing.T) {
 		t.Fatalf("expected b-only-task, got %s", claimed.ID)
 	}
 }
+
+// TestRouterListTasksWalksEveryNode pages a queue across two nodes over the
+// cluster RPC, then proves a node that cannot answer fails the page instead
+// of being skipped.
+func TestRouterListTasksWalksEveryNode(t *testing.T) {
+	ctx := context.Background()
+	a := newTestNode(t, "node-a")
+	b := newTestNode(t, "node-b")
+	t.Cleanup(a.stop)
+	pool := poolWithBufnet([]*testNode{a, b})
+	defer pool.Close()
+	ring := NewLocalRing(NewRing([]Node{a.node, b.node}), "node-a")
+	for i := range ring.nodes {
+		ring.nodes[i].GRPCAddr = "passthrough:///" + ring.nodes[i].GRPCAddr
+		ring.byID[ring.nodes[i].ID] = ring.nodes[i]
+	}
+	router := NewTaskRouter(a.repo, ring, pool)
+
+	want := map[string]bool{}
+	for i, repo := range []*pebblerepo.TaskRepository{a.repo, a.repo, b.repo, b.repo, b.repo} {
+		task, err := repo.Enqueue(ctx, domain.CmdGenerateMaster, `{}`, 5, "", 3, "", time.Time{}, "tenant-a")
+		if err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+		want[task.ID] = true
+	}
+
+	got := map[string]bool{}
+	cursor := ""
+	for pages := 0; ; pages++ {
+		if pages > 10 {
+			t.Fatal("listing never ended")
+		}
+		page, err := router.ListTasks(ctx, domain.CmdGenerateMaster, "tenant-a", domain.QueueStateReady, 2, cursor)
+		if err != nil {
+			t.Fatalf("page %d: %v", pages, err)
+		}
+		for _, task := range page.Tasks {
+			if got[task.ID] || !want[task.ID] {
+				t.Fatalf("page %d: unexpected or repeated task %s", pages, task.ID)
+			}
+			got[task.ID] = true
+		}
+		if page.NextCursor == "" {
+			break
+		}
+		cursor = page.NextCursor
+	}
+	if len(got) != len(want) {
+		t.Fatalf("listed %d of %d tasks", len(got), len(want))
+	}
+
+	b.stop()
+	if _, err := router.ListTasks(ctx, domain.CmdGenerateMaster, "tenant-a", domain.QueueStateReady, 10, ""); err == nil {
+		t.Fatal("listing with node-b down succeeded; want an error, not a partial page")
+	}
+}

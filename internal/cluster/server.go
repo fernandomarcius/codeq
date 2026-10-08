@@ -223,6 +223,19 @@ func (s *Server) QueueStats(ctx context.Context, req *clusterpb.QueueStatsReques
 	}, nil
 }
 
+// ListTasks serves one page of a queue state from this node's local tasks.
+func (s *Server) ListTasks(ctx context.Context, req *clusterpb.ListTasksRequest) (*clusterpb.ListTasksResponse, error) {
+	page, err := s.Tasks.ListTasks(ctx, domain.Command(req.Command), req.TenantId, domain.QueueState(req.State), int(req.Limit), req.Cursor)
+	if err != nil {
+		return nil, err
+	}
+	out := &clusterpb.ListTasksResponse{Tasks: make([]*clusterpb.Task, len(page.Tasks)), NextCursor: page.NextCursor}
+	for i, t := range page.Tasks {
+		out.Tasks[i] = domainTaskToProto(t)
+	}
+	return out, nil
+}
+
 func (s *Server) AdminQueues(ctx context.Context, req *clusterpb.AdminQueuesRequest) (*clusterpb.AdminQueuesResponse, error) {
 	m, err := s.Tasks.AdminQueues(ctx)
 	if err != nil {

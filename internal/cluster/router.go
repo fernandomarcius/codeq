@@ -365,6 +365,50 @@ func (r *TaskRouter) QueueStats(ctx context.Context, cmd domain.Command, tenantI
 	return local, nil
 }
 
+// ListTasks pages a queue state across the nodes in ring order: this node
+// reads its own tasks, every other node answers over the cluster RPC. A node
+// that cannot answer fails the page instead of being skipped, since a caller
+// listing in-flight work must not mistake a missing node for an empty one.
+func (r *TaskRouter) ListTasks(ctx context.Context, cmd domain.Command, tenantID string, state domain.QueueState, limit int, cursor string) (*domain.TaskPage, error) {
+	nodes := r.ring.All()
+	partitions := make([]string, len(nodes))
+	for i, n := range nodes {
+		partitions[i] = n.ID
+	}
+	return repository.ListAcrossPartitions(ctx, partitions, limit, cursor, func(ctx context.Context, nodeID string, limit int, cursor string) (*domain.TaskPage, error) {
+		if nodeID == r.ring.SelfID() {
+			return r.local.ListTasks(ctx, cmd, tenantID, state, limit, cursor)
+		}
+		return r.listRemote(ctx, nodeID, &clusterpb.ListTasksRequest{
+			Command:  string(cmd),
+			TenantId: tenantID,
+			State:    string(state),
+			Limit:    safeint.Int32(limit),
+			Cursor:   cursor,
+		})
+	})
+}
+
+func (r *TaskRouter) listRemote(ctx context.Context, nodeID string, req *clusterpb.ListTasksRequest) (*domain.TaskPage, error) {
+	node, ok := r.ring.Node(nodeID)
+	if !ok {
+		return nil, fmt.Errorf("list tasks: unknown node %s", nodeID)
+	}
+	c, err := r.pool.Client(node)
+	if err != nil {
+		return nil, fmt.Errorf("dial node %s: %w", nodeID, err)
+	}
+	resp, err := c.ListTasks(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("list tasks on node %s: %w", nodeID, err)
+	}
+	page := &domain.TaskPage{Tasks: make([]*domain.Task, len(resp.Tasks)), NextCursor: resp.NextCursor}
+	for i, t := range resp.Tasks {
+		page.Tasks[i] = protoToDomainTask(t)
+	}
+	return page, nil
+}
+
 func (r *TaskRouter) AdminQueues(ctx context.Context) (map[string]any, error) {
 	local, err := r.local.AdminQueues(ctx)
 	if err != nil {
