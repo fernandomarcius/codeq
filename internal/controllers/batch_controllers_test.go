@@ -22,6 +22,7 @@ import (
 type mockSchedulerService struct {
 	createFunc func(ctx context.Context, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey string, runAt time.Time, delaySeconds int, tenantID string) (*domain.Task, error)
 	claimFunc  func(ctx context.Context, workerID string, commands []domain.Command, leaseSeconds int, waitSeconds int, tenantID string) (*domain.Task, bool, error)
+	listFunc   func(ctx context.Context, cmd domain.Command, tenantID string, state domain.QueueState, limit int, cursor string) (*domain.TaskPage, error)
 }
 
 func (m *mockSchedulerService) CreateTask(ctx context.Context, cmd domain.Command, payload string, priority int, webhook string, maxAttempts int, idempotencyKey string, runAt time.Time, delaySeconds int, tenantID string) (*domain.Task, error) {
@@ -69,6 +70,14 @@ func (m *mockSchedulerService) AdminQueues(context.Context) (map[string]any, err
 func (m *mockSchedulerService) QueueStats(context.Context, domain.Command, string) (*domain.QueueStats, error) {
 	return nil, nil
 }
+
+func (m *mockSchedulerService) ListTasks(ctx context.Context, cmd domain.Command, tenantID string, state domain.QueueState, limit int, cursor string) (*domain.TaskPage, error) {
+	if m.listFunc != nil {
+		return m.listFunc(ctx, cmd, tenantID, state, limit, cursor)
+	}
+	return &domain.TaskPage{Tasks: []*domain.Task{}}, nil
+}
+
 func (m *mockSchedulerService) CleanupExpired(context.Context, int, time.Time) (int, error) {
 	return 0, nil
 }

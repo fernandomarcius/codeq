@@ -155,6 +155,20 @@ message QueueStatsResponse {
   int64 dlq = 4;
 }
 
+// ListTasksRequest lists one page of a (command, tenant) queue state held by
+// the receiving node. cursor is the node-local cursor of the previous page.
+message ListTasksRequest {
+  string command = 1;
+  string tenant_id = 2;
+  string state = 3;
+  int32 limit = 4;
+  string cursor = 5;
+}
+message ListTasksResponse {
+  repeated Task tasks = 1;
+  string next_cursor = 2;
+}
+
 message AdminQueuesRequest {}
 message AdminQueuesResponse {
   map<string, int64> counts = 1;
@@ -211,6 +225,8 @@ service TaskNode {
   rpc PendingLength(PendingLengthRequest) returns (PendingLengthResponse);
   rpc QueueStats(QueueStatsRequest) returns (QueueStatsResponse);
   rpc AdminQueues(AdminQueuesRequest) returns (AdminQueuesResponse);
+  // Partition-walked (caller pages node by node in ring order):
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
 
   // Bloom gossip (poll-style; a streaming version can be added later):
   rpc BloomSnapshot(BloomSnapshotRequest) returns (BloomSnapshotResponse);

@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -553,5 +554,30 @@ func TestNewSchedulerServiceDefaults(t *testing.T) {
 				t.Fatal("Expected service to be non-nil")
 			}
 		})
+	}
+}
+
+func TestListTasksValidatesAndDefaults(t *testing.T) {
+	ctx, svc := setupSchedulerTest(t)
+	for i := range DefaultTaskListLimit + 1 {
+		if _, err := svc.CreateTask(ctx, domain.CmdGenerateMaster, `{}`, 5, "", 3, "", time.Time{}, 0, "tenant-a"); err != nil {
+			t.Fatalf("create %d: %v", i, err)
+		}
+	}
+
+	page, err := svc.ListTasks(ctx, domain.CmdGenerateMaster, "tenant-a", domain.QueueStateReady, 0, "")
+	if err != nil || len(page.Tasks) != DefaultTaskListLimit || page.NextCursor == "" {
+		t.Fatalf("default page = %d tasks, cursor %q, err %v; want %d and a cursor", len(page.Tasks), page.NextCursor, err, DefaultTaskListLimit)
+	}
+	for _, limit := range []int{-1, MaxTaskListLimit + 1} {
+		if _, err := svc.ListTasks(ctx, domain.CmdGenerateMaster, "tenant-a", domain.QueueStateReady, limit, ""); !errors.Is(err, domain.ErrInvalidListLimit) {
+			t.Fatalf("limit %d: err %v, want ErrInvalidListLimit", limit, err)
+		}
+	}
+	if _, err := svc.ListTasks(ctx, domain.CmdGenerateMaster, "tenant-a", "pending", 10, ""); !errors.Is(err, domain.ErrInvalidQueueState) {
+		t.Fatalf("bad state: err %v, want ErrInvalidQueueState", err)
+	}
+	if _, err := svc.ListTasks(ctx, " ", "tenant-a", domain.QueueStateReady, 10, ""); err == nil {
+		t.Fatal("blank command: want an error")
 	}
 }
